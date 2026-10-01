@@ -3,3 +3,4 @@ dist/
 site/
 vendor/
 .idea/
+!dist/**/waf-worker
