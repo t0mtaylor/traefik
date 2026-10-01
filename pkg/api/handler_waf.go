@@ -95,6 +95,7 @@ type wafNode struct {
 	Scoped        int64 `json:"scoped"`
 	Enqueue       int64 `json:"enqueue"`
 	FailOpen      int64 `json:"failOpen"`
+	Dropped       int64 `json:"dropped"`
 	BlocklistSize int64 `json:"blocklistSize"`
 	WhitelistSize int64 `json:"whitelistSize"`
 	LastRefresh   int64 `json:"lastRefresh,omitempty"` // unix millis
@@ -127,17 +128,17 @@ type wafModsecInfo struct {
 
 // WAFResponse is the /api/waf payload.
 type WAFResponse struct {
-	Degraded  bool                `json:"degraded"`
-	Reason    string              `json:"reason,omitempty"`
-	Timestamp int64               `json:"timestamp"` // unix millis
-	Mode      string              `json:"mode"`
-	Middleware string             `json:"middleware,omitempty"`
-	Queue     wafQueueInfo        `json:"queue"`
-	Bans      wafBansInfo         `json:"bans"`
-	Lists     wafListsInfo        `json:"lists"`
-	Nodes     map[string]*wafNode `json:"nodes"`
-	Totals    wafNode             `json:"totals"`
-	Modsec    wafModsecInfo       `json:"modsec"`
+	Degraded   bool                `json:"degraded"`
+	Reason     string              `json:"reason,omitempty"`
+	Timestamp  int64               `json:"timestamp"` // unix millis
+	Mode       string              `json:"mode"`
+	Middleware string              `json:"middleware,omitempty"`
+	Queue      wafQueueInfo        `json:"queue"`
+	Bans       wafBansInfo         `json:"bans"`
+	Lists      wafListsInfo        `json:"lists"`
+	Nodes      map[string]*wafNode `json:"nodes"`
+	Totals     wafNode             `json:"totals"`
+	Modsec     wafModsecInfo       `json:"modsec"`
 }
 
 // getWAF serves GET /api/waf. Read-only, auth-gated (inherits the API router middleware),
@@ -248,6 +249,7 @@ func (n *wafNode) add(o *wafNode) {
 	n.Scoped += o.Scoped
 	n.Enqueue += o.Enqueue
 	n.FailOpen += o.FailOpen
+	n.Dropped += o.Dropped
 }
 
 func writeWAF(rw http.ResponseWriter, request *http.Request, resp WAFResponse) {
@@ -540,6 +542,8 @@ func (r *valkeyWAFReader) StatsByNode(ctx context.Context, prefix string) (map[s
 			n.Enqueue = v
 		case "failopen":
 			n.FailOpen = v
+		case "dropped":
+			n.Dropped = v
 		case "blocklist_size":
 			n.BlocklistSize = v
 		case "whitelist_size":

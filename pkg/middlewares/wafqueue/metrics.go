@@ -46,6 +46,8 @@ const (
 	ReasonRefresh = "refresh"
 	ReasonEnqueue = "enqueue"
 	ReasonResolve = "resolve"
+	// ReasonDrop labels a hot-path enqueue dropped because the bounded job channel was full.
+	ReasonDrop = "drop"
 )
 
 // NewMetrics builds the collectors and registers them on a fresh registry.

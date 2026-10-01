@@ -35,12 +35,32 @@ type ValkeyStore struct {
 	c redis.UniversalClient
 }
 
+// Fail-fast valkey client timeouts. Every valkey op runs OFF the request hot path (background
+// enqueue/refresh/stats workers), but these tiny timeouts plus zero command retries guarantee
+// that a down or churning valkey can never make a background worker block for seconds and pile
+// up behind the bounded job channel. A dead dial returns in ~DialTimeout, never the go-redis
+// default of 5s with 3 backoff retries.
+const (
+	valkeyDialTimeout  = 50 * time.Millisecond
+	valkeyReadTimeout  = 50 * time.Millisecond
+	valkeyWriteTimeout = 50 * time.Millisecond
+	valkeyPoolTimeout  = 100 * time.Millisecond
+)
+
 // NewValkeyStore builds a ValkeyStore. When sentinels are provided it uses a failover client
 // keyed on master; otherwise a plain client on addr.
 func NewValkeyStore(addr string, sentinels []string, master, password string, db int) *ValkeyStore {
 	opts := &redis.UniversalOptions{
 		Password: password,
 		DB:       db,
+		// Fail fast: tiny timeouts, no command retries, and honour context deadlines so a
+		// churning valkey never stalls a background worker.
+		DialTimeout:           valkeyDialTimeout,
+		ReadTimeout:           valkeyReadTimeout,
+		WriteTimeout:          valkeyWriteTimeout,
+		PoolTimeout:           valkeyPoolTimeout,
+		MaxRetries:            -1, // go-redis: -1 disables retries entirely
+		ContextTimeoutEnabled: true,
 	}
 	if len(sentinels) > 0 {
 		opts.Addrs = sentinels
