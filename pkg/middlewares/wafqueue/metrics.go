@@ -14,13 +14,13 @@ import (
 type Metrics struct {
 	Registry *prometheus.Registry
 
-	Requests      *prometheus.CounterVec   // waf_requests_total{action}
-	Blocks        *prometheus.CounterVec   // waf_block_total{source}
-	FailOpen      *prometheus.CounterVec   // waf_failopen_total{reason}
-	QueueDepth    prometheus.Gauge         // waf_queue_depth
-	HotPath       prometheus.Histogram     // waf_hotpath_latency_seconds
-	BlocklistSize prometheus.Gauge         // waf_blocklist_size
-	WhitelistSize prometheus.Gauge         // waf_whitelist_size
+	Requests      *prometheus.CounterVec // waf_requests_total{action}
+	Blocks        *prometheus.CounterVec // waf_block_total{source}
+	FailOpen      *prometheus.CounterVec // waf_failopen_total{reason}
+	QueueDepth    prometheus.Gauge       // waf_queue_depth
+	HotPath       prometheus.Histogram   // waf_hotpath_latency_seconds
+	BlocklistSize prometheus.Gauge       // waf_blocklist_size
+	WhitelistSize prometheus.Gauge       // waf_whitelist_size
 }
 
 // Hot-path action labels.

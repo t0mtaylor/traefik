@@ -14,9 +14,11 @@ package wafqueue
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/netip"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -26,6 +28,16 @@ import (
 )
 
 const typeName = "WafQueue"
+
+// healthKeyPrefix + healthTTL control the connection-health heartbeat the background plane
+// publishes so /api/waf can report link state without dialing valkey. The TTL is a few health
+// intervals so a node whose valkey link is dead (can't publish) goes stale/absent and the
+// dashboard shows it DOWN.
+const (
+	healthKeyPrefix = "waf:health:"
+	healthTTL       = 30 * time.Second
+	healthInterval  = 5 * time.Second
+)
 
 // DefaultScopeSkip are the built-in path patterns whose requests are passed without enqueue
 // (but still subject to the blocklist). These mirror the fleet FP fixes: static assets,
@@ -60,6 +72,12 @@ type wafQueue struct {
 	bannedKey    string
 	whitelistKey []string
 	blocklistKey []string
+
+	// Connection config, kept for the health heartbeat (never the password itself).
+	valkeyEndpoint string
+	valkeyDB       int
+	valkeyPassword string // held only to redact it out of error strings; never published
+	authConfigured bool
 
 	resolver  *RealIPResolver
 	whitelist *Matcher
@@ -125,6 +143,11 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 		metrics:      NewMetrics(),
 		breaker:      newBreaker(3, 2*time.Second),
 		jobs:         make(chan enqueueJob, 8192),
+
+		valkeyEndpoint: valkeyEndpoint(config),
+		valkeyDB:       config.ValkeyDB,
+		valkeyPassword: config.ValkeyPassword,
+		authConfigured: config.ValkeyPassword != "",
 	}
 
 	// Seed the whitelist with the trusted proxies as a belt-and-suspenders guard: a CDN edge
@@ -166,8 +189,17 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 	}
 	go m.refreshLoop(ctx, refresh)
 	go m.stats.flushLoop(ctx, 5*time.Second)
+	go m.healthLoop(ctx, healthInterval)
 
 	return m, nil
+}
+
+// valkeyEndpoint renders a display string for the configured valkey endpoint (never a secret).
+func valkeyEndpoint(config dynamic.WafQueue) string {
+	if len(config.ValkeySentinels) > 0 {
+		return "sentinel:" + config.ValkeyMaster + "@" + strings.Join(config.ValkeySentinels, ",")
+	}
+	return config.ValkeyAddr
 }
 
 func compileRegexes(src []string, logger *zerolog.Logger) []*regexp.Regexp {
@@ -325,12 +357,102 @@ func (m *wafQueue) flush(ctx context.Context, job enqueueJob) {
 	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	if err := m.store.Enqueue(cctx, m.streamKey, m.streamMaxLen, jobFields(job)); err != nil {
-		m.breaker.failure()
+		m.breaker.failure(m.redactErr(err))
 		m.metrics.failOpen(ReasonValkey)
 		m.stats.incr(statFailOpen)
 		return
 	}
 	m.breaker.success()
+}
+
+// redactErr renders a valkey error for display, stripping the configured password if it ever
+// appears (go-redis dial/auth errors do not normally echo it, but never risk leaking a secret
+// into the dashboard).
+func (m *wafQueue) redactErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if m.valkeyPassword != "" {
+		s = strings.ReplaceAll(s, m.valkeyPassword, "***")
+	}
+	return truncate(s, 200)
+}
+
+// healthLoop publishes the connection-health heartbeat every interval (off the request path),
+// so /api/waf reports link state from this cached value rather than dialing valkey. A final
+// heartbeat is not written on shutdown — a departing node SHOULD go stale.
+func (m *wafQueue) healthLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = healthInterval
+	}
+	m.publishHealth(ctx)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			m.publishHealth(ctx)
+		}
+	}
+}
+
+// nodeHealth is the JSON contract written to waf:health:<node> by the middleware and read by
+// /api/waf. It carries the CACHED circuit-breaker state + last-success timestamps so the
+// dashboard never needs a synchronous valkey ping. No secret is ever included.
+type nodeHealth struct {
+	Node             string `json:"node"`
+	TS               int64  `json:"ts"` // heartbeat publish time (ms); staleness is measured from this
+	Endpoint         string `json:"endpoint"`
+	BreakerState     string `json:"breakerState"` // closed|open|half-open
+	BreakerOpenCount int64  `json:"breakerOpenCount"`
+	LastEnqueueOkMs  int64  `json:"lastEnqueueOkMs"`
+	LastFlushOkMs    int64  `json:"lastFlushOkMs"`
+	LastErrorMs      int64  `json:"lastErrorMs"`
+	LastError        string `json:"lastError"`
+	StreamKey        string `json:"streamKey"`
+	StreamMaxLen     int64  `json:"streamMaxLen"`
+	DB               int    `json:"db"`
+	AuthConfigured   bool   `json:"authConfigured"`
+	DialTimeoutMs    int64  `json:"dialTimeoutMs"`
+	ReadTimeoutMs    int64  `json:"readTimeoutMs"`
+	WriteTimeoutMs   int64  `json:"writeTimeoutMs"`
+}
+
+// publishHealth writes one heartbeat. Best-effort: on a down valkey the SET fails (bounded by a
+// tiny timeout) and the key goes stale, which the dashboard reads as DOWN.
+func (m *wafQueue) publishHealth(ctx context.Context) {
+	if m.store == nil || m.stats == nil {
+		return
+	}
+	snap := m.breaker.snapshot()
+	h := nodeHealth{
+		Node:             m.stats.node,
+		TS:               time.Now().UnixMilli(),
+		Endpoint:         m.valkeyEndpoint,
+		BreakerState:     snap.State,
+		BreakerOpenCount: snap.OpenCount,
+		LastEnqueueOkMs:  snap.LastOkMs,
+		LastFlushOkMs:    m.stats.lastFlushOk(),
+		LastErrorMs:      snap.LastErrMs,
+		LastError:        snap.LastErr,
+		StreamKey:        m.streamKey,
+		StreamMaxLen:     m.streamMaxLen,
+		DB:               m.valkeyDB,
+		AuthConfigured:   m.authConfigured,
+		DialTimeoutMs:    valkeyDialTimeout.Milliseconds(),
+		ReadTimeoutMs:    valkeyReadTimeout.Milliseconds(),
+		WriteTimeoutMs:   valkeyWriteTimeout.Milliseconds(),
+	}
+	b, err := json.Marshal(h)
+	if err != nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, valkeyDialTimeout+valkeyWriteTimeout)
+	defer cancel()
+	_ = m.store.SetHealth(cctx, healthKeyPrefix+m.stats.node, string(b), healthTTL)
 }
 
 // refreshLoop periodically rebuilds the whitelist and blocklist tries from valkey. On error it

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,7 +73,13 @@ type Worker struct {
 	ttdf   TTDFFeeder
 	cfg    Config
 	log    *slog.Logger
+
+	lastConsumeMs atomic.Int64 // unix millis of the last successful stream read (consume heartbeat)
 }
+
+// LastConsumeMs reports when the worker last successfully read from the stream (0 if never).
+// Used by the connection-health heartbeat so the dashboard can show worker liveness.
+func (w *Worker) LastConsumeMs() int64 { return w.lastConsumeMs.Load() }
 
 // NewWorker builds a Worker.
 func NewWorker(cons StreamConsumer, modsec ModsecClient, bans BanStore, ttdf TTDFFeeder, cfg Config) *Worker {
@@ -128,6 +135,9 @@ func (w *Worker) ProcessBatch(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// A successful read (even an empty one) means the worker→valkey link is alive; record it for
+	// the connection-health heartbeat.
+	w.lastConsumeMs.Store(time.Now().UnixMilli())
 	var ackable []string
 	for _, job := range jobs {
 		if w.handle(ctx, job) {

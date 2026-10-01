@@ -56,6 +56,10 @@ type wafReader interface {
 	SetCardinality(ctx context.Context, keys []string) (int64, error)
 	Get(ctx context.Context, key string) (string, bool, error)
 	StatsByNode(ctx context.Context, prefix string) (map[string]*wafNode, error)
+	// Health SCANs <prefix>* and returns the raw heartbeat JSON values keyed by their full key.
+	// These are written by the background plane (middleware + worker), so reading them reports
+	// the CACHED link state — the handler never issues a PING/INFO of its own.
+	Health(ctx context.Context, prefix string) (map[string]string, error)
 	Close() error
 }
 
@@ -68,6 +72,7 @@ type wafConn struct {
 	password      string
 	db            int
 	streamKey     string
+	streamMaxLen  int64
 	bannedKey     string
 	statsPrefix   string
 	group         string
@@ -77,6 +82,21 @@ type wafConn struct {
 	middleware    string // middleware name, for display
 	found         bool   // a WafQueue middleware was found in the runtime config
 }
+
+// wafHealthPrefix is the key prefix for the background-published connection-health heartbeats.
+// Middleware writes waf:health:<node>; the worker writes waf:health:worker:<consumer>.
+const (
+	wafHealthPrefix       = "waf:health:"
+	wafWorkerHealthPrefix = "waf:health:worker:"
+	// wafHealthStaleAfterMs: a heartbeat older than this means the node's valkey link is down
+	// (it could not publish). Mirrors the middleware's 30s health TTL with headroom.
+	wafHealthStaleAfterMs = 45000
+	// Display-only client timeouts; mirror pkg/middlewares/wafqueue/store.go. The live values
+	// are also carried per-node in each heartbeat (authoritative if these ever drift).
+	wafDialTimeoutMs  = 50
+	wafReadTimeoutMs  = 50
+	wafWriteTimeoutMs = 50
+)
 
 // ---- JSON response shapes ----
 
@@ -126,6 +146,56 @@ type wafModsecInfo struct {
 	Healthy   *bool `json:"healthy"`
 }
 
+// wafConfigInfo echoes what the middleware is pointed at (never the password). Built from the
+// runtime config, so it is present even when valkey is unreachable.
+type wafConfigInfo struct {
+	Endpoint       string `json:"endpoint"`
+	StreamKey      string `json:"streamKey"`
+	StreamMaxLen   int64  `json:"streamMaxLen"`
+	DB             int    `json:"db"`
+	AuthConfigured bool   `json:"authConfigured"`
+	Group          string `json:"group"`
+	DialTimeoutMs  int64  `json:"dialTimeoutMs"`
+	ReadTimeoutMs  int64  `json:"readTimeoutMs"`
+	WriteTimeoutMs int64  `json:"writeTimeoutMs"`
+}
+
+// wafConnHealth is the per-node (and aggregate) valkey link health, derived purely from the
+// cached heartbeat + circuit-breaker state — never a live ping from the handler.
+type wafConnHealth struct {
+	State            string `json:"state"`        // "connected" | "degraded" | "down"
+	BreakerState     string `json:"breakerState"` // "closed" | "open" | "half-open" | "unknown"
+	BreakerOpenCount int64  `json:"breakerOpenCount"`
+	LastEnqueueOkMs  int64  `json:"lastEnqueueOkMs,omitempty"`
+	LastFlushOkMs    int64  `json:"lastFlushOkMs,omitempty"`
+	LastErrorMs      int64  `json:"lastErrorMs,omitempty"`
+	LastError        string `json:"lastError,omitempty"`
+	Dropped          int64  `json:"dropped"`
+	HeartbeatMs      int64  `json:"heartbeatMs,omitempty"` // when this node last published health
+	Stale            bool   `json:"stale"`                 // heartbeat older than the stale threshold
+	Endpoint         string `json:"endpoint,omitempty"`
+}
+
+// wafWorkerInfo summarises the waf-worker fleet from its heartbeats + the stream consumer group.
+type wafWorkerInfo struct {
+	Group         string `json:"group"`
+	Replicas      int    `json:"replicas"`      // number of live worker heartbeats
+	Pending       int64  `json:"pending"`       // unacked in the consumer group (lag)
+	LastConsumeMs int64  `json:"lastConsumeMs"` // most recent consume across replicas
+	HeartbeatMs   int64  `json:"heartbeatMs"`   // most recent worker heartbeat
+	State         string `json:"state"`         // "up" | "degraded" | "down"
+}
+
+// workerHealth mirrors the JSON the waf-worker publishes to waf:health:worker:<consumer>.
+type workerHealth struct {
+	Consumer      string `json:"consumer"`
+	Group         string `json:"group"`
+	TS            int64  `json:"ts"`
+	LastConsumeMs int64  `json:"lastConsumeMs"`
+	State         string `json:"state"`
+	Endpoint      string `json:"endpoint"`
+}
+
 // WAFResponse is the /api/waf payload.
 type WAFResponse struct {
 	Degraded   bool                `json:"degraded"`
@@ -139,6 +209,14 @@ type WAFResponse struct {
 	Nodes      map[string]*wafNode `json:"nodes"`
 	Totals     wafNode             `json:"totals"`
 	Modsec     wafModsecInfo       `json:"modsec"`
+	// Config is what the middleware is pointed at (built from the runtime config, no valkey I/O).
+	Config wafConfigInfo `json:"config"`
+	// Connection is the per-node valkey link health from the cached heartbeat/breaker state,
+	// plus an aggregate rollup. Never a live ping.
+	Connection    map[string]*wafConnHealth `json:"connection"`
+	ConnectionAgg wafConnHealth             `json:"connectionAgg"`
+	// Worker summarises the waf-worker fleet.
+	Worker wafWorkerInfo `json:"worker"`
 }
 
 // getWAF serves GET /api/waf. Read-only, auth-gated (inherits the API router middleware),
@@ -169,6 +247,14 @@ func (h *Handler) getWAF(rw http.ResponseWriter, request *http.Request) {
 	if resp.Mode == "" {
 		resp.Mode = "unknown"
 	}
+
+	// Config is built purely from the runtime config — no valkey I/O — so it is always present,
+	// even when valkey is unreachable. Connection/Worker default to "down" and are upgraded from
+	// the cached heartbeats below.
+	resp.Config = conn.configInfo()
+	resp.Connection = map[string]*wafConnHealth{}
+	resp.ConnectionAgg = wafConnHealth{State: "down", BreakerState: "unknown"}
+	resp.Worker = wafWorkerInfo{Group: conn.group, State: "down"}
 
 	reader := h.wafResolveReader(conn)
 	if reader == nil {
@@ -238,7 +324,149 @@ func (h *Handler) getWAF(rw http.ResponseWriter, request *http.Request) {
 		resp.Modsec.Healthy = &healthy
 	}
 
+	// Connection health + worker status, from the CACHED heartbeats written by the background
+	// plane (never a live ping here). A read failure just leaves the "down" defaults in place.
+	if health, err := reader.Health(ctx, wafHealthPrefix); err == nil {
+		h.applyHealth(&resp, conn, health, resp.Timestamp)
+	}
+
 	writeWAF(rw, request, resp)
+}
+
+// applyHealth folds the raw heartbeat JSON values into the per-node connection health, the
+// aggregate, and the worker summary. Stale (old heartbeat) or absent ⇒ down; breaker open ⇒
+// degraded; otherwise connected.
+func (h *Handler) applyHealth(resp *WAFResponse, conn wafConn, health map[string]string, nowMs int64) {
+	var workers []workerHealth
+	for key, val := range health {
+		if strings.HasPrefix(key, wafWorkerHealthPrefix) {
+			var wh workerHealth
+			if json.Unmarshal([]byte(val), &wh) == nil {
+				workers = append(workers, wh)
+			}
+			continue
+		}
+		var nh nodeHealthWire
+		if json.Unmarshal([]byte(val), &nh) != nil {
+			continue
+		}
+		node := nh.Node
+		if node == "" {
+			node = strings.TrimPrefix(key, wafHealthPrefix)
+		}
+		stale := nh.TS == 0 || nowMs-nh.TS > wafHealthStaleAfterMs
+		ch := &wafConnHealth{
+			State:            connState(stale, nh.BreakerState),
+			BreakerState:     nh.BreakerState,
+			BreakerOpenCount: nh.BreakerOpenCount,
+			LastEnqueueOkMs:  nh.LastEnqueueOkMs,
+			LastFlushOkMs:    nh.LastFlushOkMs,
+			LastErrorMs:      nh.LastErrorMs,
+			LastError:        nh.LastError,
+			HeartbeatMs:      nh.TS,
+			Stale:            stale,
+			Endpoint:         nh.Endpoint,
+		}
+		if n := resp.Nodes[node]; n != nil {
+			ch.Dropped = n.Dropped
+		}
+		resp.Connection[node] = ch
+	}
+
+	// Aggregate: worst state wins (down > degraded > connected); sum open-counts/dropped.
+	agg := wafConnHealth{State: "connected", BreakerState: "closed"}
+	seen := false
+	for _, ch := range resp.Connection {
+		seen = true
+		agg.BreakerOpenCount += ch.BreakerOpenCount
+		agg.Dropped += ch.Dropped
+		if ch.HeartbeatMs > agg.HeartbeatMs {
+			agg.HeartbeatMs = ch.HeartbeatMs
+		}
+		if stateRank(ch.State) > stateRank(agg.State) {
+			agg.State = ch.State
+			agg.BreakerState = ch.BreakerState
+			agg.LastError = ch.LastError
+			agg.LastErrorMs = ch.LastErrorMs
+		}
+	}
+	if seen {
+		resp.ConnectionAgg = agg
+	}
+
+	// Worker rollup.
+	w := wafWorkerInfo{Group: conn.group, Pending: resp.Queue.Pending}
+	for _, wh := range workers {
+		w.Replicas++
+		if wh.TS > w.HeartbeatMs {
+			w.HeartbeatMs = wh.TS
+		}
+		if wh.LastConsumeMs > w.LastConsumeMs {
+			w.LastConsumeMs = wh.LastConsumeMs
+		}
+	}
+	switch {
+	case w.Replicas == 0 || nowMs-w.HeartbeatMs > wafHealthStaleAfterMs:
+		w.State = "down"
+	default:
+		w.State = "up"
+	}
+	resp.Worker = w
+}
+
+// nodeHealthWire mirrors the middleware's nodeHealth JSON (handler-side copy to avoid importing
+// the middleware package).
+type nodeHealthWire struct {
+	Node             string `json:"node"`
+	TS               int64  `json:"ts"`
+	Endpoint         string `json:"endpoint"`
+	BreakerState     string `json:"breakerState"`
+	BreakerOpenCount int64  `json:"breakerOpenCount"`
+	LastEnqueueOkMs  int64  `json:"lastEnqueueOkMs"`
+	LastFlushOkMs    int64  `json:"lastFlushOkMs"`
+	LastErrorMs      int64  `json:"lastErrorMs"`
+	LastError        string `json:"lastError"`
+}
+
+// connState maps staleness + breaker state to the dashboard link state.
+func connState(stale bool, breaker string) string {
+	if stale {
+		return "down"
+	}
+	if breaker == "open" {
+		return "degraded"
+	}
+	return "connected"
+}
+
+func stateRank(s string) int {
+	switch s {
+	case "down":
+		return 2
+	case "degraded":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// configInfo builds the display config from the connection (never the password).
+func (c wafConn) configInfo() wafConfigInfo {
+	endpoint := c.addr
+	if len(c.sentinels) > 0 {
+		endpoint = "sentinel:" + c.master + "@" + strings.Join(c.sentinels, ",")
+	}
+	return wafConfigInfo{
+		Endpoint:       endpoint,
+		StreamKey:      c.streamKey,
+		StreamMaxLen:   c.streamMaxLen,
+		DB:             c.db,
+		AuthConfigured: c.password != "",
+		Group:          c.group,
+		DialTimeoutMs:  wafDialTimeoutMs,
+		ReadTimeoutMs:  wafReadTimeoutMs,
+		WriteTimeoutMs: wafWriteTimeoutMs,
+	}
 }
 
 func (n *wafNode) add(o *wafNode) {
@@ -297,6 +525,10 @@ func (h *Handler) wafConn() wafConn {
 			c.master = w.ValkeyMaster
 			c.password = w.ValkeyPassword
 			c.db = w.ValkeyDB
+			c.streamMaxLen = w.StreamMaxLen
+			if c.streamMaxLen == 0 {
+				c.streamMaxLen = dynamic.WafQueueDefaultStreamMaxLen
+			}
 			if w.StreamKey != "" {
 				c.streamKey = w.StreamKey
 			}
@@ -358,7 +590,19 @@ type valkeyWAFReader struct {
 }
 
 func newValkeyWAFReader(conn wafConn) *valkeyWAFReader {
-	opts := &redis.UniversalOptions{Password: conn.password, DB: conn.db}
+	opts := &redis.UniversalOptions{
+		Password: conn.password,
+		DB:       conn.db,
+		// Fail fast so a down/churning valkey can never make the read-only /api/waf handler hang:
+		// tiny timeouts + no command retries, honouring the request context deadline. The
+		// handler already fails soft (degraded:true) on the canary read; these make it ~instant.
+		DialTimeout:           100 * time.Millisecond,
+		ReadTimeout:           100 * time.Millisecond,
+		WriteTimeout:          100 * time.Millisecond,
+		PoolTimeout:           150 * time.Millisecond,
+		MaxRetries:            -1,
+		ContextTimeoutEnabled: true,
+	}
 	if len(conn.sentinels) > 0 {
 		opts.Addrs = conn.sentinels
 		opts.MasterName = conn.master
@@ -477,6 +721,40 @@ func (r *valkeyWAFReader) Get(ctx context.Context, key string) (string, bool, er
 		return "", false, err
 	}
 	return v, true, nil
+}
+
+// Health SCANs <prefix>* and GETs each heartbeat JSON value. These keys are written by the
+// background plane; reading them is a cheap cached-state read, not a liveness ping.
+func (r *valkeyWAFReader) Health(ctx context.Context, prefix string) (map[string]string, error) {
+	var keys []string
+	var cursor uint64
+	for {
+		batch, next, err := r.c.Scan(ctx, cursor, prefix+"*", 256).Result()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	out := make(map[string]string, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	pipe := r.c.Pipeline()
+	cmds := make([]*redis.StringCmd, len(keys))
+	for i, k := range keys {
+		cmds[i] = pipe.Get(ctx, k)
+	}
+	_, _ = pipe.Exec(ctx)
+	for i, k := range keys {
+		if v, err := cmds[i].Result(); err == nil {
+			out[k] = v
+		}
+	}
+	return out, nil
 }
 
 // StatsByNode SCANs <prefix>* and folds every waf:stats:<node>:<field> key into a per-node
