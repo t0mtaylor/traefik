@@ -142,6 +142,15 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 	// path: the hot path only does an atomic add, a background flusher pipelines to valkey.
 	m.stats = newStatsCollector(m.store, config.StatsPrefix, "")
 
+	// Report the ACTUAL loaded trie sizes to the dashboard from the start, before the first
+	// refresh tick. The whitelist is seeded above from TrustedProxies (the fleet CF/CloudFront/
+	// owner/CGNAT whitelist), so its size is non-zero immediately even when no valkey whitelist
+	// keys are configured — the dashboard used to show "0 CIDRs" here, which read as an empty
+	// whitelist when the trie actually holds the full set. These gauges are the TRUE trie
+	// lengths, never a hardcoded value.
+	m.stats.setGauge(statWhitelistSize, int64(m.whitelist.Len()))
+	m.stats.setGauge(statBlocklistSize, int64(m.blocklist.Len()))
+
 	if m.shadow {
 		logger.Info().Msg("WafQueue middleware in SHADOW mode (observe-only, will never block)")
 	} else {
@@ -361,6 +370,16 @@ func (m *wafQueue) refreshOnce(ctx context.Context) {
 	if d, err := m.store.QueueDepth(cctx, m.streamKey); err == nil {
 		m.metrics.QueueDepth.Set(float64(d))
 	}
+
+	// Always report the ACTUAL live trie sizes (len of the loaded CIDR tries), not the size of
+	// the sets just fetched from valkey. The whitelist keeps its TrustedProxies seed even when
+	// no valkey whitelist keys are configured, so this is the true count the dashboard shows
+	// (~233 whitelist CIDRs; blocklist legitimately 0 in shadow until the worker ban-feed is
+	// loaded). Keeping it unconditional means a transient refresh error never resets the gauge.
+	m.stats.setGauge(statWhitelistSize, int64(m.whitelist.Len()))
+	m.stats.setGauge(statBlocklistSize, int64(m.blocklist.Len()))
+	m.metrics.WhitelistSize.Set(float64(m.whitelist.Len()))
+	m.metrics.BlocklistSize.Set(float64(m.blocklist.Len()))
 
 	m.stats.setGauge(statRefreshTS, time.Now().UnixMilli())
 }

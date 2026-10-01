@@ -18,11 +18,11 @@ import (
 // ---- fakes ----
 
 type fakeStore struct {
-	mu      sync.Mutex
-	enqErr  error
-	memErr  error
-	last    map[string]any
-	enqN    int
+	mu        sync.Mutex
+	enqErr    error
+	memErr    error
+	last      map[string]any
+	enqN      int
 	members   []string
 	closed    bool
 	flushIncr map[string]int64
@@ -349,5 +349,33 @@ func TestIsShadowConfig(t *testing.T) {
 	}
 	if (&dynamic.WafQueue{Shadow: &fal}).IsShadow() {
 		t.Error("*false must be enforce")
+	}
+}
+
+// TestRefreshOnce_ReportsTrueTrieSizes guards the dashboard trie-size fix: refreshOnce must
+// publish the ACTUAL live trie lengths as the whitelist_size/blocklist_size gauges, even when
+// no valkey whitelist/blocklist keys are configured and the whitelist is only the
+// TrustedProxies seed. The old code only set the gauge inside `if len(fetched) > 0`, so a
+// seeded-but-not-valkey-backed whitelist reported 0 — which read as an empty whitelist.
+func TestRefreshOnce_ReportsTrueTrieSizes(t *testing.T) {
+	fs := &fakeStore{} // Members returns empty: exercises the no-valkey-keys path.
+	m, _ := testMW(t, mwOpts{shadow: true, store: fs})
+	// Seed the whitelist exactly as New() does from TrustedProxies (the fleet whitelist).
+	m.whitelist.Swap(BuildTrie([]string{"104.16.0.0/13", "172.64.0.0/13", "131.0.72.0/22"}))
+	wantWL := int64(m.whitelist.Len())
+	if wantWL == 0 {
+		t.Fatal("precondition: seeded whitelist trie must be non-empty")
+	}
+	m.stats = newStatsCollector(fs, "waf:stats:", "mxtest")
+
+	m.refreshOnce(context.Background())
+	m.stats.flush(context.Background())
+
+	if got := fs.flushSet["waf:stats:mxtest:whitelist_size"]; got != wantWL {
+		t.Fatalf("whitelist_size=%d want %d (true trie size, not the fetched set size)", got, wantWL)
+	}
+	// Blocklist is legitimately empty in shadow until the worker ban-feed is loaded.
+	if got := fs.flushSet["waf:stats:mxtest:blocklist_size"]; got != 0 {
+		t.Fatalf("blocklist_size=%d want 0 (no feed loaded in shadow)", got)
 	}
 }
