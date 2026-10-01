@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
@@ -28,6 +29,21 @@ type fakeStore struct {
 	flushIncr map[string]int64
 	flushSet  map[string]int64
 	flushErr  error
+
+	healthKey string
+	healthVal string
+	healthErr error
+}
+
+func (f *fakeStore) SetHealth(_ context.Context, key, val string, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.healthErr != nil {
+		return f.healthErr
+	}
+	f.healthKey = key
+	f.healthVal = val
+	return nil
 }
 
 func (f *fakeStore) Enqueue(_ context.Context, _ string, _ int64, fields map[string]any) error {

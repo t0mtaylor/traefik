@@ -11,6 +11,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -119,6 +120,10 @@ func main() {
 		"stream", o.streamKey, "group", o.group, "consumer", o.consumer,
 		"modsec", o.modsecURL, "banTTL", o.banTTL.String())
 
+	// Connection-health heartbeat: publish worker liveness so the WAF dashboard can show
+	// replicas / last-consume / worker->valkey link. Off the processing path; best-effort.
+	go workerHeartbeat(ctx, rdb, o, w, log)
+
 	if err := w.Run(ctx); err != nil && ctx.Err() == nil {
 		log.Error("worker exited", "err", err)
 		os.Exit(1)
@@ -126,8 +131,61 @@ func main() {
 	log.Info("waf-worker stopped")
 }
 
+// workerHealthKeyPrefix mirrors the handler's wafWorkerHealthPrefix.
+const workerHealthKeyPrefix = "waf:health:worker:"
+
+// workerHeartbeat writes waf:health:worker:<consumer> every 5s with a 30s TTL. If valkey is
+// down the write fails and the key expires, so the dashboard shows the worker DOWN. The write
+// uses a tiny timeout so it never piles up.
+func workerHeartbeat(ctx context.Context, rdb redis.UniversalClient, o options, w *Worker, log *slog.Logger) {
+	endpoint := o.valkeyAddr
+	if len(o.valkeySentinels) > 0 {
+		endpoint = "sentinel:" + o.valkeyMaster + "@" + strings.Join(o.valkeySentinels, ",")
+	}
+	key := workerHealthKeyPrefix + o.consumer
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	publish := func() {
+		payload := map[string]any{
+			"consumer":      o.consumer,
+			"group":         o.group,
+			"ts":            time.Now().UnixMilli(),
+			"lastConsumeMs": w.LastConsumeMs(),
+			"state":         "up",
+			"endpoint":      endpoint,
+		}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		if err := rdb.Set(cctx, key, string(b), 30*time.Second).Err(); err != nil {
+			log.Debug("worker heartbeat publish failed", "err", err)
+		}
+	}
+	publish()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			publish()
+		}
+	}
+}
+
 func newClient(o options) redis.UniversalClient {
-	opts := &redis.UniversalOptions{Password: o.valkeyPassword, DB: o.valkeyDB}
+	opts := &redis.UniversalOptions{
+		Password: o.valkeyPassword,
+		DB:       o.valkeyDB,
+		// Fail-fast on a DOWN valkey (dial), but keep the default ReadTimeout so the blocking
+		// XReadGroup consume (Block=BlockMin) is not cut short. MaxRetries off to avoid pileup.
+		DialTimeout:  200 * time.Millisecond,
+		WriteTimeout: 200 * time.Millisecond,
+		PoolTimeout:  250 * time.Millisecond,
+		MaxRetries:   -1,
+	}
 	if len(o.valkeySentinels) > 0 {
 		opts.Addrs = o.valkeySentinels
 		opts.MasterName = o.valkeyMaster
@@ -190,9 +248,9 @@ func jobFromValues(id string, v map[string]any) Job {
 // ---- modsec HTTP client ----
 
 type modsecClient struct {
-	url      string
-	deny     map[int]bool
-	hc       *http.Client
+	url  string
+	deny map[int]bool
+	hc   *http.Client
 }
 
 func newModsecClient(o options) *modsecClient {
