@@ -1153,6 +1153,11 @@ func (in *Middleware) DeepCopyInto(out *Middleware) {
 		*out = new(GrpcWeb)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.WafQueue != nil {
+		in, out := &in.WafQueue, &out.WafQueue
+		*out = new(WafQueue)
+		(*in).DeepCopyInto(*out)
+	}
 	if in.Plugin != nil {
 		in, out := &in.Plugin, &out.Plugin
 		*out = make(map[string]PluginConf, len(*in))

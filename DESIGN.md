@@ -1,0 +1,250 @@
+# Async WAF for the Traefik fork — `feature/waf-queue` (Phase 1: shadow)
+
+Status: **Phase 1 — SHADOW**. The middleware is compiled into the fork but defaults to
+observe-only (`shadow: true`): it resolves, classifies, enqueues and emits metrics, but
+**never blocks**. Enforcement (Phase 5) is a later, separately-gated flip.
+
+This document is the source of truth for the valkey key schema, the middleware config, the
+hot-path precedence, the degradation matrix, the metrics, and the shadow→enforce flip. It is
+based on `project_traefik_waf_queue_async_2026_10_01` and must not drift from the code; if the
+implementation diverges, update this file in the same change.
+
+## 1. Why
+
+The in-line modsec middleware (`waf-modsec`, `ModsecurityUrl`, `TimeoutMillis: 2000`,
+`UnhealthyWafBackOffPeriodSecs: 30`) adds up to **2–3 s of pure latency** per request — the
+engine is in `DetectionOnly` soak so the wait buys nothing but a log line. Under mx memory
+thrash the modsec backend spikes to 1.6–5 s and traefik enters `marking modsec as unhealthy`
+backoff loops.
+
+The async WAF moves inspection **off** the request path: the hot path resolves the real
+client IP, checks two in-memory CIDR tries (whitelist, blocklist), enqueues a compact job to
+a valkey stream, and immediately calls the next handler. A separate `waf-worker` service
+drains the stream, calls modsec out-of-band, and writes verdicts back to `waf:banned` (which
+the next trie refresh folds into the blocklist). First flagged request passes; every
+subsequent request from that IP is blocked — which kills scanners after request #1–2 without
+putting modsec in anyone's critical path.
+
+**Scope: the EXTERNAL traefik (`traefik_traefik`) only.** The internal traefik (`traefik-int`)
+serves trusted VPC/service-to-service traffic where the real-IP/whitelist/blocklist model is
+meaningless; it gets no WAF.
+
+## 2. Hot path precedence (fail-open at every layer)
+
+Order is fixed. Every step fails **open** (on any error → pass to the backend, never block).
+
+1. **Resolve REAL client IP.** `RealIPHeaders` in order (default `CF-Connecting-IP`,
+   `X-Real-Ip`, `X-Forwarded-For` left-most) — but a header is only trusted when the immediate
+   peer (`RemoteAddr`) is in `TrustedProxies` (CF / CloudFront / internal LB / overlay). If the
+   peer is not trusted, headers are ignored and `RemoteAddr` is used. Falls back to
+   `RemoteAddr` when no header is present. This is the precondition tracked in
+   `project_modsec_waf_not_inspecting_real_client_ip` — a WAF that bans the proxy IP bans
+   everyone behind it.
+2. **WHITELIST (highest precedence — beats every blocklist).** In-memory CIDR trie unioned
+   from: CF edges, CloudFront edges, owner IPs + `EXCLUDE_IPS`, mobile/CGNAT ranges, and
+   RFC1918/bogons. A whitelist hit → **pass immediately, never enqueued, never blocked.** This
+   encodes the CLAUDE.md hard rule "never ban a CDN edge" and the mobile/CGNAT FP class.
+3. **BLOCKLIST.** One in-memory CIDR trie (longest-prefix, 336k+ CIDRs) unioned from the TTDF
+   shared blocklist + external feeds (Spamhaus DROP/EDROP, blocklist.de, AbuseIPDB, Firehol —
+   already aggregated by the blocklist orchestrator) + `waf:banned` (worker detections). Match
+   on the REAL IP → **block** (in shadow mode: log `would-block`, pass).
+4. **SCOPE gate.** `ScopeSkip` regexes (static assets, stream `.ts/.aac/.m3u8`, health,
+   `/.well-known/*`, mail-autodiscovery) → **pass, no enqueue.** Scope is checked *after* the
+   blocklist so a known-bad IP is still blocked even on a static URL; scope only suppresses
+   *inspection* of benign high-volume paths.
+5. **ENQUEUE + PASS.** `XADD waf:stream` (bounded, fire-and-forget, short timeout); then
+   `next.ServeHTTP` immediately. A failed enqueue increments `waf_failopen_total` and still
+   passes.
+
+`InlineRoutes` regexes (e.g. `/admin`, auth POSTs, mutating methods) are recorded for the
+Phase-5 in-line sync-block path; in Phase 1 they are parsed and exposed but do not change hot
+behaviour (everything is async).
+
+## 3. Valkey key schema
+
+Backing store = the ttdf-valkey HA stack (master + replica + 3 sentinel) on mx. The client is
+`github.com/redis/go-redis/v9` (sentinel `FailoverClient` when `ValkeySentinels`/`ValkeyMaster`
+are set, otherwise a plain client on `ValkeyAddr`).
+
+| Key | Type | Written by | Read by | Notes |
+|-----|------|-----------|---------|-------|
+| `waf:stream` | stream | middleware (`XADD`) | worker (`XREADGROUP`) | job queue; bounded `MAXLEN ~ StreamMaxLen` |
+| `waf:banned` | set/hash of IP or CIDR → meta | worker | middleware (trie refresh) | each member carries a TTL; folded into the blocklist trie |
+| `waf:banned:<ip>` | string w/ TTL | worker | — (TTL expiry) | per-IP TTL marker so bans auto-expire (`BanTTL`, default 1 h) |
+| `waf:stats:requests` / `:blocks` / `:failopen` / `:enqueued` | counters | middleware + worker | dashboard / `/api/waf` | mirror of the Prometheus counters for the read-only API |
+| `waf:wl:<name>` (`WhitelistKeys`) | set | blocklist orchestrator / CF+CloudFront refreshers | middleware | SMEMBERS → whitelist trie |
+| `waf:bl:<name>` (`BlocklistKeys`) | set | blocklist orchestrator (reuse runtime.json/ipset pipeline) | middleware | SMEMBERS → blocklist trie |
+| `waf:refresh` | pub/sub channel | orchestrator / worker | middleware | optional immediate-refresh signal (otherwise periodic `RefreshInterval`) |
+
+Stream job shape (one `XADD` field map, compact):
+
+```
+ip   = <real client IP>
+m    = <HTTP method>
+p    = <request path (no query)>
+h    = <Host / X-Forwarded-Host>
+ua   = <User-Agent, truncated>
+ts   = <unix millis>
+rid  = <request id, if present>
+```
+
+Whitelist precedence vs. every tier is maintained end-to-end exactly as
+`feedback_whitelist_all_tiers`: a `whitelist:true` member must be honoured by the ipset
+merger, the TTDF module, the DO LB applier **and** this trie. The worker never writes a
+whitelisted IP to `waf:banned` (it re-checks the whitelist trie before banning).
+
+## 4. Middleware config (`dynamic.WafQueue`)
+
+Field (yaml) | Type | Default | Meaning
+--- | --- | --- | ---
+`valkeyAddr` | string | — | single-node valkey `host:port` (used when no sentinels)
+`valkeySentinels` | []string | — | sentinel `host:port` list (HA)
+`valkeyMaster` | string | — | sentinel master name
+`valkeyPassword` | string | — | auth
+`valkeyDB` | int | 0 | db index
+`shadow` | *bool | **true** | observe-only; **nil/absent ⇒ true** (decoder-independent safe default). Only `shadow: false` can ever enable blocking.
+`streamKey` | string | `waf:stream` | job stream
+`streamMaxLen` | int64 | 1000000 | approx `MAXLEN` bound
+`bannedKey` | string | `waf:banned` | ban set folded into blocklist
+`whitelistKeys` | []string | — | valkey set keys → whitelist trie
+`blocklistKeys` | []string | — | valkey set keys → blocklist trie
+`statsPrefix` | string | `waf:stats:` | counter key prefix
+`scopeSkip` | []string | built-in | regexes that skip enqueue (static/stream/health/well-known/autodiscovery)
+`realIPHeaders` | []string | `CF-Connecting-IP,X-Real-Ip,X-Forwarded-For` | real-IP header order
+`trustedProxies` | []string | — | CIDRs whose peer may set the real-IP header (CF/CloudFront/internal)
+`inlineRoutes` | []string | — | regexes reserved for Phase-5 in-line sync block
+`banTTL` | duration | 1h | default ban lifetime (worker)
+`refreshInterval` | duration | 60s | trie refresh period
+`blockStatus` | int | 403 | block response; `444` ⇒ drop the connection (no response)
+
+`Shadow` is a pointer precisely so "default true" holds under **every** config provider —
+the file (yaml) provider does not call `SetDefaults()` on nested dynamic structs, so a plain
+`bool` would default to `false` (= enforce) and violate the Phase-1 safety guarantee. A
+`SetDefaults()` is still provided for the label/KV path.
+
+## 5. Degradation matrix
+
+Condition | Behaviour
+--- | ---
+valkey unreachable / enqueue error | **fail-open**: pass the request, `waf_failopen_total{reason="valkey"}`++; tries keep last-known contents
+trie refresh fails | keep **last-known** tries (feed-stale), `waf_failopen_total{reason="refresh"}`; never empties a populated trie on a transient error
+modsec down (worker) | worker **retries** with backoff; detection delayed; hot path untouched; no ban written until a verdict is obtained
+worker down entirely | stream grows to `StreamMaxLen` then trims oldest; hot path untouched; bans simply stop being added
+real-IP unresolvable | use `RemoteAddr`; a request is never blocked on an unverifiable identity (fail-open)
+`shadow: true` (default) | full pipeline runs **except** the block — logs `would-block`, passes
+block status misconfig (0) | treated as 403
+
+The invariant: **no failure mode blocks legitimate traffic.** Every error path is a pass.
+
+## 6. Metrics (Prometheus)
+
+Registered on a dedicated registry (see `metrics.go`); wiring into traefik's own
+`/metrics` registry is a TODO (needs the observability middleware plumbing).
+
+- `waf_requests_total{action}` — action ∈ {pass, whitelist, would_block, block, skip, enqueue}
+- `waf_block_total{source}` — source ∈ {blocklist, banned, feed}
+- `waf_queue_depth` — gauge, approx `XLEN waf:stream`
+- `waf_hotpath_latency_seconds` — histogram of hot-path cost (target sub-ms)
+- `waf_failopen_total{reason}` — reason ∈ {valkey, refresh, enqueue, resolve}
+- `waf_blocklist_size` / `waf_whitelist_size` — gauges, trie entry counts
+
+Worker adds (see `cmd/waf-worker`): `waf_worker_processed_total`, `waf_worker_bad_total`,
+`waf_worker_modsec_up`, `waf_worker_modsec_latency_seconds`, `waf_worker_retry_total`.
+
+These flow vmagent → vmstorage → grafana for history/alerting (later phase).
+
+## 7. waf-worker
+
+Separate binary (`cmd/waf-worker`), a swarm service with replicas and a valkey consumer
+group. Loop: `XREADGROUP` a batch from `waf:stream` → POST each job to the modsec endpoint
+(the swarm VIP, configurable, with retries + exponential backoff + fail-open) → on a bad
+verdict write `waf:banned` (+ per-IP TTL marker) and emit a structured log line + call the
+TTDF ban-feed hook (TODO: wire to the real TTDF pipeline so nginx + DO LB + fail2ban enforce
+fleet-wide). `XACK` after processing. Whitelisted IPs are re-checked and never banned.
+
+Config via env/flags: `WAF_VALKEY_ADDR` / sentinels, `WAF_STREAM`, `WAF_GROUP`,
+`WAF_CONSUMER`, `WAF_MODSEC_URL`, `WAF_BAN_TTL`, `WAF_BATCH`, `WAF_BLOCK_STATUS`.
+
+## 8. Shadow → enforce flip (Phase 5, separately gated)
+
+1. Phase 1 (this): compiled in, `shadow: true` everywhere. Validate detection parity vs the
+   in-line modsec logs; confirm zero would-blocks on CF/CloudFront/mobile/owner.
+2. Fix real-IP end-to-end first (the open precondition). A WAF that sees the proxy IP must
+   never enforce.
+3. Canary: roll ONE external-traefik replica with `shadow: false` on a test router behind a
+   healthcheck-gated `--update-failure-action rollback`; verify routing + correct real-IP
+   bans + CF/CloudFront/mobile never blocked.
+4. Widen to all replicas; keep the previous image tag for instant
+   `docker service rollback traefik_traefik`.
+5. Fail-open means even an enforcement bug cannot black-hole traffic.
+
+Nothing in Phase 1 deploys; the build is pushed to `localhost:5000` only.
+
+## 9. Phase 2 — read-only `/api/waf` endpoint (native)
+
+`feature/waf-queue` adds a native, **read-only** JSON endpoint that the dashboard WAF tab
+(`feature/waf-dashboard`) consumes. It is registered on traefik's existing API router
+(`pkg/api/handler.go` → `createRouter`), so it **inherits the dashboard/API router's auth and
+host** (`tfmx.thetomtaylor.co.uk`) and is **never a new public route**. It is served only for
+`GET`; any other method returns `405`.
+
+### 9.1 Contract
+
+`GET /api/waf[?limit=N]` → `200 application/json`. `limit` bounds the recent-bans list
+(default 20, max 100). The endpoint is **fail-soft**: valkey unreachable or no WAF middleware
+configured returns a `200` with `"degraded": true` and a `reason`, **never a `5xx`** — a valkey
+outage can never take the dashboard down.
+
+```jsonc
+{
+  "degraded": false,
+  "reason": "",                 // set when degraded
+  "timestamp": 1730000000000,
+  "mode": "shadow",             // "shadow" | "enforce" | "unknown" (from the live middleware config)
+  "middleware": "waf@file",
+  "queue":  { "depth": 7, "pending": 3, "stream": "waf:stream", "group": "waf-workers" },
+  "bans":   { "active": 12, "recent": [ { "ip": "1.2.3.4", "source": "modsec 403", "ttl": 3400, "expiresAt": 1730003400000 } ] },
+  "lists":  { "blocklistSize": 336000, "whitelistSize": 1200, "blocklistKeys": ["waf:bl:main"], "whitelistKeys": ["waf:wl:cf"], "lastRefresh": 1730000000000 },
+  "nodes":  { "mx01": { "pass": 100, "whitelist": 3, "wouldBlock": 2, "block": 5, "scoped": 40, "enqueue": 90, "failOpen": 1, "blocklistSize": 336000, "whitelistSize": 1200, "lastRefresh": 1730000000000 } },
+  "totals": { "pass": 150, "block": 6, "enqueue": 135, "... (sum across nodes)": 0 },
+  "modsec": { "available": false, "healthy": null }
+}
+```
+
+### 9.2 Valkey reads (all cheap, read-only, swarm-wide because the store is shared)
+
+| Field | valkey command(s) |
+|-------|-------------------|
+| `queue.depth` | `XLEN waf:stream` |
+| `queue.pending` (worker lag) | `XPENDING waf:stream waf-workers` (NOGROUP ⇒ 0) |
+| `bans.active` | `SCARD waf:banned` |
+| `bans.recent` | `SSCAN waf:banned` (capped at 2000) → pipelined `PTTL`+`GET waf:banned:<ip>`, sorted by TTL remaining (most-recent first), top N |
+| `lists.blocklistSize` / `whitelistSize` | `SCARD` over the middleware's `BlocklistKeys` / `WhitelistKeys` (and the per-node gauges, max) |
+| `nodes.*`, `totals` | `SCAN waf:stats:*` → pipelined `GET` (see §9.3) |
+| `modsec` | optional `GET waf:modsec:up` (reserved; the Phase-1 worker does not emit it yet) |
+
+The valkey connection (addr / sentinels / master / password / db) and the key names are read
+from the **live `WafQueue` middleware config** in the runtime configuration, so the endpoint
+needs no separate wiring; `WAF_VALKEY_ADDR` / `WAF_VALKEY_SENTINELS` / `WAF_API_GROUP` env vars
+override for an instance that only proxies. The reader is built lazily and cached; it is an
+interface (`wafReader`) so the handler test substitutes a fake and asserts read-only + fail-soft
+behaviour without a live valkey.
+
+### 9.3 Per-node stats mirror (new)
+
+Phase 1 wrote no stat counters (only a Prometheus registry). Phase 2 adds a tiny per-node
+mirror so the dashboard has live rates without new request-path state:
+
+- The hot path does only a **lock-free atomic increment** per action (`statsCollector.incr`).
+- A background flusher (every 5 s, off the request path, fail-open) pipelines the accumulated
+  deltas to valkey: **`INCRBY waf:stats:<node>:<action>`** for counters and **`SET`** for
+  gauges, each with a sliding 1 h TTL so a departed node drops out of the aggregate.
+- `<node>` = `WAF_NODE` env or the hostname. Actions: `pass`, `whitelist`, `would_block`,
+  `block`, `scoped`, `enqueue`, `failopen`. Gauges: `blocklist_size`, `whitelist_size`,
+  `refresh_ts`.
+
+This supersedes the single-counter `waf:stats:requests`/`:blocks`/… row in §3 (those global
+keys are ignored by the aggregator, which keys on `<node>:<field>`). The counters are a
+best-effort dashboard mirror; Prometheus (§6) remains the source of truth for history/alerting.
+The write path is behind the same fail-open guards as the rest of the middleware: a valkey
+error during flush re-queues the deltas for the next tick and never touches live traffic.
