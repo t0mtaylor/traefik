@@ -50,6 +50,17 @@ type statsCollector struct {
 
 	counts map[string]*atomic.Int64 // cumulative deltas, swapped to 0 on flush
 	gauges map[string]*atomic.Int64 // absolute values, read on flush
+
+	lastFlushOkMs atomic.Int64 // unix millis of the last successful valkey flush (health heartbeat)
+}
+
+// lastFlushOk returns the unix-millis time of the last successful stats flush (0 if never).
+// Nil-safe.
+func (s *statsCollector) lastFlushOk() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.lastFlushOkMs.Load()
 }
 
 // newStatsCollector builds a collector. prefix falls back to the default; node falls back to
@@ -140,7 +151,10 @@ func (s *statsCollector) flush(ctx context.Context) {
 				c.Add(d)
 			}
 		}
+		return
 	}
+	// Record the last successful flush time for the connection-health heartbeat.
+	s.lastFlushOkMs.Store(time.Now().UnixMilli())
 }
 
 // flushLoop flushes on an interval until ctx is cancelled, with a final best-effort flush on

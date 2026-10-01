@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,6 +19,10 @@ import (
 )
 
 func bptr(b bool) *bool { return &b }
+
+// wafTestPassword is a sentinel secret in the test config; it must NEVER appear in the /api/waf
+// payload (the handler exposes "authConfigured", never the password).
+const wafTestPassword = "test-valkey-pw-DO-NOT-LEAK"
 
 // mockWAFReader is a pure read-only fake. The wafReader interface exposes no mutating method,
 // so read-only is guaranteed at the type level; this fake additionally records that nothing
@@ -29,9 +35,15 @@ type mockWAFReader struct {
 	recent   []wafBan
 	blCard   int64
 	wlCard   int64
-	nodes    map[string]*wafNode
-	getVals  map[string]string
-	closed   bool
+	nodes     map[string]*wafNode
+	getVals   map[string]string
+	health    map[string]string
+	healthErr error
+	closed    bool
+}
+
+func (m *mockWAFReader) Health(_ context.Context, _ string) (map[string]string, error) {
+	return m.health, m.healthErr
 }
 
 func (m *mockWAFReader) QueueDepth(_ context.Context, _ string) (int64, error) {
@@ -75,13 +87,15 @@ func wafTestHandler(t *testing.T, reader wafReader, valkeyAddr string) *Handler 
 			"waf@file": {
 				Middleware: &dynamic.Middleware{
 					WafQueue: &dynamic.WafQueue{
-						ValkeyAddr:    valkeyAddr,
-						StreamKey:     "waf:stream",
-						BannedKey:     "waf:banned",
-						StatsPrefix:   "waf:stats:",
-						WhitelistKeys: []string{"waf:wl:cf"},
-						BlocklistKeys: []string{"waf:bl:main"},
-						Shadow:        bptr(true),
+						ValkeyAddr:     valkeyAddr,
+						ValkeyPassword: wafTestPassword,
+						StreamKey:      "waf:stream",
+						StreamMaxLen:   1000000,
+						BannedKey:      "waf:banned",
+						StatsPrefix:    "waf:stats:",
+						WhitelistKeys:  []string{"waf:wl:cf"},
+						BlocklistKeys:  []string{"waf:bl:main"},
+						Shadow:         bptr(true),
 					},
 				},
 			},
@@ -151,12 +165,107 @@ func TestGetWAF_FailSoftWhenValkeyDown(t *testing.T) {
 
 	// Never 500 the dashboard: valkey down returns a 200 with degraded:true.
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	raw, _ := io.ReadAll(resp.Body)
 	var out WAFResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.NoError(t, json.Unmarshal(raw, &out))
 	assert.True(t, out.Degraded)
 	assert.NotEmpty(t, out.Reason)
 	// Mode is still reported from config even when valkey is unreachable.
 	assert.Equal(t, "shadow", out.Mode)
+	// CONFIG is built from config (no valkey I/O) so it is present even when valkey is down.
+	assert.Equal(t, "127.0.0.1:6379", out.Config.Endpoint)
+	assert.Equal(t, "waf:stream", out.Config.StreamKey)
+	assert.True(t, out.Config.AuthConfigured)
+	assert.Equal(t, int64(50), out.Config.DialTimeoutMs)
+	// CONNECTION shows DOWN (no heartbeat read on the degraded canary path).
+	assert.Equal(t, "down", out.ConnectionAgg.State)
+	assert.Equal(t, "down", out.Worker.State)
+	// The password is never serialised anywhere in the payload.
+	assert.NotContains(t, string(raw), wafTestPassword)
+}
+
+func TestGetWAF_ReportsConnectionHealthAndConfig(t *testing.T) {
+	now := time.Now().UnixMilli()
+	nodeHB := fmt.Sprintf(`{"node":"mx01","ts":%d,"endpoint":"ttdf-valkey-master:6379","breakerState":"closed","breakerOpenCount":0,"lastEnqueueOkMs":%d,"lastFlushOkMs":%d,"streamKey":"waf:stream","streamMaxLen":1000000,"db":0,"authConfigured":true,"dialTimeoutMs":50}`, now, now, now)
+	degradedHB := fmt.Sprintf(`{"node":"mx02","ts":%d,"endpoint":"ttdf-valkey-master:6379","breakerState":"open","breakerOpenCount":4,"lastErrorMs":%d,"lastError":"dial tcp i/o timeout","streamKey":"waf:stream","authConfigured":true}`, now, now)
+	workerHB := fmt.Sprintf(`{"consumer":"mx01","group":"waf-workers","ts":%d,"lastConsumeMs":%d,"state":"up","endpoint":"ttdf-valkey-master:6379"}`, now, now)
+	reader := &mockWAFReader{
+		depth:   5,
+		pending: 2,
+		nodes: map[string]*wafNode{
+			"mx01": {Pass: 10, Dropped: 3},
+			"mx02": {Pass: 8},
+		},
+		health: map[string]string{
+			"waf:health:mx01":        nodeHB,
+			"waf:health:mx02":        degradedHB,
+			"waf:health:worker:mx01": workerHB,
+		},
+	}
+	h := wafTestHandler(t, reader, "ttdf-valkey-master:6379")
+	server := httptest.NewServer(h.createRouter())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/waf")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	raw, _ := io.ReadAll(resp.Body)
+	var out WAFResponse
+	require.NoError(t, json.Unmarshal(raw, &out))
+
+	// CONFIG
+	assert.Equal(t, "ttdf-valkey-master:6379", out.Config.Endpoint)
+	assert.Equal(t, "waf:stream", out.Config.StreamKey)
+	assert.Equal(t, int64(1000000), out.Config.StreamMaxLen)
+	assert.Equal(t, "waf-workers", out.Config.Group)
+	assert.True(t, out.Config.AuthConfigured)
+	assert.Equal(t, int64(50), out.Config.DialTimeoutMs)
+
+	// CONNECTION per node, driven by the cached heartbeat + breaker state.
+	require.Contains(t, out.Connection, "mx01")
+	assert.Equal(t, "connected", out.Connection["mx01"].State)
+	assert.Equal(t, "closed", out.Connection["mx01"].BreakerState)
+	assert.Equal(t, int64(3), out.Connection["mx01"].Dropped) // folded from node stats
+	require.Contains(t, out.Connection, "mx02")
+	assert.Equal(t, "degraded", out.Connection["mx02"].State)
+	assert.Equal(t, "open", out.Connection["mx02"].BreakerState)
+	assert.Equal(t, int64(4), out.Connection["mx02"].BreakerOpenCount)
+	// Aggregate: worst state wins (mx02 is degraded).
+	assert.Equal(t, "degraded", out.ConnectionAgg.State)
+
+	// WORKER
+	assert.Equal(t, 1, out.Worker.Replicas)
+	assert.Equal(t, "up", out.Worker.State)
+	assert.Equal(t, "waf-workers", out.Worker.Group)
+	assert.Equal(t, int64(2), out.Worker.Pending)
+
+	// No secret anywhere.
+	assert.NotContains(t, string(raw), wafTestPassword)
+}
+
+func TestGetWAF_StaleHeartbeatIsDown(t *testing.T) {
+	old := time.Now().UnixMilli() - 120000 // 2 min old ⇒ stale
+	staleHB := fmt.Sprintf(`{"node":"mx01","ts":%d,"breakerState":"closed","streamKey":"waf:stream"}`, old)
+	reader := &mockWAFReader{
+		depth:  1,
+		nodes:  map[string]*wafNode{"mx01": {Pass: 1}},
+		health: map[string]string{"waf:health:mx01": staleHB},
+	}
+	h := wafTestHandler(t, reader, "ttdf-valkey-master:6379")
+	server := httptest.NewServer(h.createRouter())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/waf")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	var out WAFResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Contains(t, out.Connection, "mx01")
+	assert.True(t, out.Connection["mx01"].Stale)
+	assert.Equal(t, "down", out.Connection["mx01"].State)
 }
 
 func TestGetWAF_DegradedWhenNoConnection(t *testing.T) {

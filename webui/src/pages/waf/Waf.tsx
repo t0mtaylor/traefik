@@ -1,7 +1,7 @@
 import { Badge, Box, Card, Flex, Grid, H2, Text, Tooltip } from '@traefik-labs/faency'
 import { ReactNode, useMemo } from 'react'
 
-import useWaf, { WafBan, WafNode, WafResponse } from 'hooks/use-waf'
+import useWaf, { WafBan, WafConfig, WafConnHealth, WafNode, WafResponse, WafWorker } from 'hooks/use-waf'
 import PageTitle from 'layout/PageTitle'
 
 const fmt = (n?: number): string => (typeof n === 'number' ? n.toLocaleString() : '—')
@@ -118,6 +118,103 @@ const ModeBanner = ({ mode }: { mode: string }) => {
   )
 }
 
+// Link-state palette: connected=green, degraded=amber, down=red. Drives the connection panel
+// and the per-node status dots so valkey trouble is visible at a glance. Faency has no green
+// token scale, so green is a raw hex (radix green9) while amber/red use the orange/red tokens;
+// `badge` is a safe Faency Badge variant.
+type LinkStyle = { badge: 'green' | 'orange' | 'red'; fg: string; bg: string; border: string; label: string }
+const linkStyle = (state: string): LinkStyle => {
+  switch (state) {
+    case 'connected':
+    case 'up':
+      return { badge: 'green', fg: '$hiContrast', bg: 'transparent', border: '1px solid $colors$tableRowBorder', label: 'CONNECTED' }
+    case 'degraded':
+      return { badge: 'orange', fg: '$orange11', bg: '$orange3', border: '1px solid $colors$orange7', label: 'DEGRADED' }
+    default:
+      return { badge: 'red', fg: '$red11', bg: '$red3', border: '1px solid $colors$red7', label: 'DOWN' }
+  }
+}
+
+const dotColor = (state: string): string =>
+  state === 'connected' || state === 'up' ? '#30a46c' : state === 'degraded' ? '#f76b15' : '#e5484d'
+
+// A small coloured dot for per-node link state.
+const StatusDot = ({ state }: { state: string }) => (
+  <Box css={{ width: 10, height: 10, borderRadius: '$round', backgroundColor: dotColor(state), flexShrink: 0 }} />
+)
+
+// ConnectionPanel is the prominent valkey link-health block: aggregate state banner + the
+// breaker/heartbeat signals. All of it is from the cached heartbeat, never a live ping.
+const ConnectionPanel = ({ agg, worker }: { agg?: WafConnHealth; worker?: WafWorker }) => {
+  const state = agg?.state || 'down'
+  const s = linkStyle(state)
+  const breaker = agg?.breakerState || 'unknown'
+  return (
+    <Card css={{ p: '$3', backgroundColor: s.bg, border: s.border }} data-testid="waf-connection">
+      <Flex direction="column" gap={3}>
+        <Flex align="center" css={{ gap: '$2', flexWrap: 'wrap' }}>
+          <StatusDot state={state} />
+          <Text css={{ fontSize: '$4', fontWeight: '$bold', letterSpacing: 0.3, color: s.fg }}>valkey</Text>
+          <Badge variant={s.badge}>{s.label}</Badge>
+          <Badge variant={breaker === 'open' ? 'red' : breaker === 'half-open' ? 'orange' : 'green'}>
+            breaker: {breaker}
+          </Badge>
+          {typeof agg?.breakerOpenCount === 'number' && agg.breakerOpenCount > 0 && (
+            <Text css={{ color: s.fg, fontSize: '$2' }}>opened ×{fmt(agg.breakerOpenCount)}</Text>
+          )}
+        </Flex>
+        <Grid css={{ gridTemplateColumns: autoGrid(150), gap: '$3' }}>
+          <StatTile label="Last XADD ok" value={agg?.lastEnqueueOkMs ? ago(agg.lastEnqueueOkMs) : '—'} hint="enqueue heartbeat" />
+          <StatTile label="Last flush ok" value={agg?.lastFlushOkMs ? ago(agg.lastFlushOkMs) : '—'} hint="stats flush heartbeat" />
+          <StatTile label="Dropped" value={fmt(agg?.dropped)} hint="queue-full events" />
+          <StatTile
+            label="Worker"
+            value={worker ? `${fmt(worker.replicas)} · ${worker.state}` : '—'}
+            hint={worker ? `consume ${worker.lastConsumeMs ? ago(worker.lastConsumeMs) : 'never'}` : undefined}
+          />
+        </Grid>
+        {agg?.lastError && (
+          <Text css={{ color: s.fg, fontSize: '$1', fontFamily: 'monospace', wordBreak: 'break-word' }}>
+            last error{agg.lastErrorMs ? ` (${ago(agg.lastErrorMs)})` : ''}: {agg.lastError}
+          </Text>
+        )}
+      </Flex>
+    </Card>
+  )
+}
+
+// A plain key/value row for the configuration panel.
+const ConfigRow = ({ k, v }: { k: string; v: ReactNode }) => (
+  <Flex justify="between" css={{ gap: '$3', minWidth: 0 }}>
+    <Text css={{ color: '$grayBlue9', fontSize: '$2', flexShrink: 0 }}>{k}</Text>
+    <Text css={{ color: '$hiContrast', fontSize: '$2', fontFamily: 'monospace', wordBreak: 'break-all', textAlign: 'right' }}>
+      {v}
+    </Text>
+  </Flex>
+)
+
+const ConfigPanel = ({ config, worker }: { config?: WafConfig; worker?: WafWorker }) => (
+  <Card css={{ p: '$3' }} data-testid="waf-config">
+    <Flex direction="column" gap={2}>
+      <Text css={{ color: '$grayBlue9', fontSize: '$1', textTransform: 'uppercase', letterSpacing: 0.2 }}>
+        Configuration
+      </Text>
+      <ConfigRow k="endpoint" v={config?.endpoint || '—'} />
+      <ConfigRow k="stream" v={config?.streamKey || '—'} />
+      <ConfigRow k="stream max len" v={fmt(config?.streamMaxLen)} />
+      <ConfigRow k="db" v={typeof config?.db === 'number' ? config.db : '—'} />
+      <ConfigRow k="auth" v={config?.authConfigured ? 'configured' : 'none'} />
+      <ConfigRow
+        k="timeouts (d/r/w)"
+        v={config ? `${config.dialTimeoutMs}/${config.readTimeoutMs}/${config.writeTimeoutMs}ms` : '—'}
+      />
+      <ConfigRow k="worker group" v={worker?.group || config?.group || '—'} />
+      <ConfigRow k="worker replicas" v={fmt(worker?.replicas)} />
+      <ConfigRow k="worker lag" v={fmt(worker?.pending)} />
+    </Flex>
+  </Card>
+)
+
 const StatTile = ({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) => (
   <Card css={{ p: '$3', minWidth: 0 }}>
     <Flex direction="column" gap={1} css={{ minWidth: 0 }}>
@@ -183,10 +280,20 @@ const Metric = ({ label, value, desc, tone }: { label: string; value: number; de
   )
 }
 
-const NodeTile = ({ name, node }: { name: string; node: WafNode }) => (
+const NodeTile = ({ name, node, conn }: { name: string; node: WafNode; conn?: WafConnHealth }) => (
   <Card css={{ p: '$3', minWidth: 0 }} data-testid={`waf-node-${name}`}>
     <Flex direction="column" gap={3} css={{ minWidth: 0 }}>
-      <Text css={{ fontWeight: '$semiBold', color: '$hiContrast' }}>{name}</Text>
+      <Flex align="center" justify="between" css={{ gap: '$2' }}>
+        <Text css={{ fontWeight: '$semiBold', color: '$hiContrast' }}>{name}</Text>
+        {conn && (
+          <Tooltip content={`valkey ${conn.state}${conn.breakerState ? ` · breaker ${conn.breakerState}` : ''}`}>
+            <Box as="span" css={{ display: 'flex', alignItems: 'center', gap: '$1', cursor: 'help' }}>
+              <StatusDot state={conn.state} />
+              <Text css={{ color: '$grayBlue9', fontSize: '$1' }}>{conn.state}</Text>
+            </Box>
+          </Tooltip>
+        )}
+      </Flex>
       <Grid css={{ gridTemplateColumns: autoGrid(72), gap: '$3 $2' }}>
         {COUNTERS.map((c) => (
           <Metric key={c.key} label={c.label} value={nodeValue(node, c.key)} desc={c.desc} tone={c.tone} />
@@ -250,6 +357,18 @@ export const WafView = ({ data }: { data: WafResponse }) => {
       )}
 
       <Flex direction="column" gap={2}>
+        <H2 css={{ fontSize: '$5', color: '$headingDefault' }}>Valkey connection &amp; configuration</H2>
+        <Text css={{ color: '$grayBlue9', fontSize: '$2' }}>
+          Link health from the background heartbeat + circuit-breaker state (no live ping). Stale or absent
+          heartbeat ⇒ down; breaker open ⇒ degraded.
+        </Text>
+        <Grid css={{ gridTemplateColumns: autoGrid(320), gap: '$3' }}>
+          <ConnectionPanel agg={data.connectionAgg} worker={data.worker} />
+          <ConfigPanel config={data.config} worker={data.worker} />
+        </Grid>
+      </Flex>
+
+      <Flex direction="column" gap={2}>
         <H2 css={{ fontSize: '$5', color: '$headingDefault' }}>Live queue &amp; lists</H2>
         <Text css={{ color: '$grayBlue9', fontSize: '$2' }}>
           Current valkey-backed state, shared across the whole fleet.
@@ -281,7 +400,7 @@ export const WafView = ({ data }: { data: WafResponse }) => {
         ) : (
           <Grid css={{ gridTemplateColumns: autoGrid(260), gap: '$3' }}>
             {nodeNames.map((name) => (
-              <NodeTile key={name} name={name} node={data.nodes[name]} />
+              <NodeTile key={name} name={name} node={data.nodes[name]} conn={data.connection?.[name]} />
             ))}
           </Grid>
         )}

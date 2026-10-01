@@ -116,6 +116,8 @@ are set, otherwise a plain client on `ValkeyAddr`).
 | `waf:wl:<name>` (`WhitelistKeys`) | set | blocklist orchestrator / CF+CloudFront refreshers | middleware | SMEMBERS → whitelist trie |
 | `waf:bl:<name>` (`BlocklistKeys`) | set | blocklist orchestrator (reuse runtime.json/ipset pipeline) | middleware | SMEMBERS → blocklist trie |
 | `waf:refresh` | pub/sub channel | orchestrator / worker | middleware | optional immediate-refresh signal (otherwise periodic `RefreshInterval`) |
+| `waf:health:<node>` | string (JSON), TTL 30s | middleware (health heartbeat, every 5s) | dashboard / `/api/waf` | cached connection health: breaker state, last-ok timestamps, config echo. Absent/stale ⇒ node DOWN. Never the password |
+| `waf:health:worker:<consumer>` | string (JSON), TTL 30s | worker (heartbeat, every 5s) | dashboard / `/api/waf` | worker liveness: last-consume ts, group, endpoint. Replica count = number of live keys |
 
 Stream job shape (one `XADD` field map, compact):
 
@@ -305,6 +307,38 @@ keys are ignored by the aggregator, which keys on `<node>:<field>`). The counter
 best-effort dashboard mirror; Prometheus (§6) remains the source of truth for history/alerting.
 The write path is behind the same fail-open guards as the rest of the middleware: a valkey
 error during flush re-queues the deltas for the next tick and never touches live traffic.
+
+### 9.4 Connection health + configuration (observability)
+
+Added so valkey connection problems are visible at a glance (the gap during the 2026-10-01
+outage). Two blocks in the `/api/waf` payload:
+
+**`config`** — what the middleware is pointed at, built purely from the runtime config (**no
+valkey I/O**, so it is present even when valkey is down). Never the password:
+`endpoint`, `streamKey`, `streamMaxLen`, `db`, `authConfigured` (bool), `group`,
+`dialTimeoutMs`/`readTimeoutMs`/`writeTimeoutMs` (50ms).
+
+**`connection`** (per node) + **`connectionAgg`** (worst-state rollup) + **`worker`** — link
+health. `state` ∈ {`connected` (green), `degraded` (amber, breaker open), `down` (red, stale/
+absent heartbeat)}, plus `breakerState` (closed|open|half-open), `breakerOpenCount`,
+`lastEnqueueOkMs`, `lastFlushOkMs`, `lastErrorMs`, `lastError` (redacted), `dropped`,
+`heartbeatMs`, `stale`. `worker`: `group`, `replicas` (live heartbeats), `pending` (lag),
+`lastConsumeMs`, `state`.
+
+**The health mechanism is heartbeat-based, never a synchronous ping.** The handler must never
+hang if valkey is down, so it does **not** issue a `PING`/`INFO`. Instead:
+
+- The middleware's background plane publishes `waf:health:<node>` every 5s (`SET … EX 30`) with
+  the **cached** circuit-breaker snapshot + last-success timestamps. The worker publishes
+  `waf:health:worker:<consumer>` the same way. Both are off the request/consume path, bounded
+  by the 50ms/200ms client timeouts.
+- `/api/waf` reads those keys with its existing fail-soft bounded reads (the handler's own
+  valkey client also uses fail-fast 100ms timeouts + `MaxRetries=-1`, so a blackholed valkey
+  returns ~instantly as `degraded:true`). State is derived from the **cached** heartbeat:
+  heartbeat older than 45s (TTL + headroom) or absent ⇒ `down`; `breakerState==open` ⇒
+  `degraded`; else `connected`. If valkey is fully unreachable the canary read fails first and
+  the whole response is `degraded:true` with `connectionAgg.state=down` — but `config` is still
+  populated. The password is never serialised in any field.
 
 ## 10. Phase 2 — dashboard WAF tab (`feature/waf-dashboard`)
 

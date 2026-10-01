@@ -25,6 +25,10 @@ type Store interface {
 	// (cumulative), each set entry as SET (absolute gauge). All keys get a sliding TTL so dead
 	// nodes expire. It is called off the request path by the stats flusher and must fail-open.
 	FlushStats(ctx context.Context, incr map[string]int64, set map[string]int64) error
+	// SetHealth publishes the connection-health heartbeat (a small JSON string) under key with
+	// a short TTL, so the read-only /api/waf endpoint can report link state from this cached
+	// value instead of dialing valkey itself. Off the request path, fail-open.
+	SetHealth(ctx context.Context, key, val string, ttl time.Duration) error
 	// Close releases the client.
 	Close() error
 }
@@ -117,6 +121,11 @@ func (s *ValkeyStore) FlushStats(ctx context.Context, incr map[string]int64, set
 	}
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// SetHealth implements Store.
+func (s *ValkeyStore) SetHealth(ctx context.Context, key, val string, ttl time.Duration) error {
+	return s.c.Set(ctx, key, val, ttl).Err()
 }
 
 // Close implements Store.

@@ -2,9 +2,11 @@ package wafqueue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -290,4 +292,69 @@ func BenchmarkHotPath_ValkeyDown(b *testing.B) {
 	m, cancel := benchMW(NewValkeyStore("192.0.2.1:6379", nil, "", "", 0))
 	defer cancel()
 	benchServe(b, m)
+}
+
+// TestPublishHealth_ReportsBreakerConfigAndRedacts proves the connection-health heartbeat
+// carries the cached breaker state + config and never leaks the valkey password. Two failing
+// flushes trip the breaker; publishHealth then writes waf:health:<node> with state "open".
+func TestPublishHealth_ReportsBreakerConfigAndRedacts(t *testing.T) {
+	const pw = "s3cr3t-pw-xyz"
+	fs := &fakeStore{enqErr: errors.New("dial tcp: AUTH failed using password " + pw)}
+	m, _ := testMW(t, mwOpts{shadow: true, store: fs})
+	m.stats = newStatsCollector(fs, "waf:stats:", "mxhealth")
+	m.breaker = newBreaker(2, time.Second)
+	m.valkeyEndpoint = "ttdf-valkey-master:6379"
+	m.valkeyPassword = pw
+	m.authConfigured = true
+
+	m.flush(context.Background(), enqueueJob{ip: "1.1.1.1"})
+	m.flush(context.Background(), enqueueJob{ip: "1.1.1.1"}) // trips breaker open
+	m.publishHealth(context.Background())
+
+	if fs.healthKey != "waf:health:mxhealth" {
+		t.Fatalf("health key=%q want waf:health:mxhealth", fs.healthKey)
+	}
+	if strings.Contains(fs.healthVal, pw) {
+		t.Fatalf("password leaked into health payload: %s", fs.healthVal)
+	}
+	var h nodeHealth
+	if err := json.Unmarshal([]byte(fs.healthVal), &h); err != nil {
+		t.Fatalf("health payload not valid JSON: %v", err)
+	}
+	if h.BreakerState != "open" {
+		t.Fatalf("breakerState=%q want open", h.BreakerState)
+	}
+	if h.BreakerOpenCount < 1 {
+		t.Fatalf("breakerOpenCount=%d want >=1", h.BreakerOpenCount)
+	}
+	if h.Endpoint != "ttdf-valkey-master:6379" || h.StreamKey != "waf:stream" || !h.AuthConfigured {
+		t.Fatalf("config fields wrong: %+v", h)
+	}
+	if h.DialTimeoutMs != valkeyDialTimeout.Milliseconds() {
+		t.Fatalf("dialTimeoutMs=%d want %d", h.DialTimeoutMs, valkeyDialTimeout.Milliseconds())
+	}
+	if h.LastError == "" || h.LastErrorMs == 0 {
+		t.Fatal("expected last error to be recorded")
+	}
+}
+
+// TestBreakerSnapshot_States checks the snapshot state machine used by the dashboard.
+func TestBreakerSnapshot_States(t *testing.T) {
+	b := newBreaker(2, 30*time.Millisecond)
+	if s := b.snapshot(); s.State != "closed" {
+		t.Fatalf("fresh breaker state=%q want closed", s.State)
+	}
+	b.failure("e")
+	b.failure("e") // open
+	if s := b.snapshot(); s.State != "open" || s.OpenCount != 1 {
+		t.Fatalf("after trip: state=%q open=%d want open/1", s.State, s.OpenCount)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if s := b.snapshot(); s.State != "half-open" {
+		t.Fatalf("after cooldown: state=%q want half-open", s.State)
+	}
+	b.success()
+	if s := b.snapshot(); s.State != "closed" {
+		t.Fatalf("after success: state=%q want closed", s.State)
+	}
 }
