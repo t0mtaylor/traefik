@@ -46,6 +46,40 @@ const sample: WafResponse = {
     whitelistSize: 0,
   },
   modsec: { available: false, healthy: null },
+  config: {
+    endpoint: 'ttdf-valkey-master:6379',
+    streamKey: 'waf:stream',
+    streamMaxLen: 1000000,
+    db: 0,
+    authConfigured: true,
+    group: 'waf-workers',
+    dialTimeoutMs: 50,
+    readTimeoutMs: 50,
+    writeTimeoutMs: 50,
+  },
+  connection: {
+    mx01: {
+      state: 'connected',
+      breakerState: 'closed',
+      breakerOpenCount: 0,
+      lastEnqueueOkMs: Date.now() - 1000,
+      lastFlushOkMs: Date.now() - 2000,
+      dropped: 0,
+      heartbeatMs: Date.now() - 1000,
+      stale: false,
+    },
+  },
+  connectionAgg: {
+    state: 'connected',
+    breakerState: 'closed',
+    breakerOpenCount: 0,
+    lastEnqueueOkMs: Date.now() - 1000,
+    lastFlushOkMs: Date.now() - 2000,
+    dropped: 0,
+    heartbeatMs: Date.now() - 1000,
+    stale: false,
+  },
+  worker: { group: 'waf-workers', replicas: 1, pending: 3, lastConsumeMs: Date.now() - 1500, heartbeatMs: Date.now() - 1000, state: 'up' },
 }
 
 afterEach(() => vi.clearAllMocks())
@@ -74,6 +108,42 @@ describe('<Waf />', () => {
     expect(getByTestId('waf-counter-legend')).toBeInTheDocument()
     // The "requests are cumulative hit counters, not list sizes" clarification is present.
     expect(getByText(/cumulative, since task restart/i)).toBeInTheDocument()
+  })
+
+  it('shows the valkey connection panel and configuration', () => {
+    vi.mocked(useWaf).mockReturnValue({ data: sample, error: undefined, isLoading: false })
+
+    const { getByTestId, getAllByText } = renderWithProviders(<Waf />)
+    expect(getByTestId('waf-connection')).toHaveTextContent('CONNECTED')
+    expect(getByTestId('waf-connection')).toHaveTextContent('breaker: closed')
+    const config = getByTestId('waf-config')
+    expect(config).toHaveTextContent('ttdf-valkey-master:6379')
+    expect(config).toHaveTextContent('50/50/50ms')
+    expect(config).toHaveTextContent('configured')
+    // endpoint appears in both connection endpoint context and config.
+    expect(getAllByText(/waf:stream/i).length).toBeGreaterThan(0)
+  })
+
+  it('renders the degraded (breaker open) and down connection states', () => {
+    vi.mocked(useWaf).mockReturnValue({
+      data: {
+        ...sample,
+        connectionAgg: { ...sample.connectionAgg, state: 'degraded', breakerState: 'open', breakerOpenCount: 4, lastError: 'dial tcp i/o timeout', lastErrorMs: Date.now() - 500 },
+      },
+      error: undefined,
+      isLoading: false,
+    })
+    const { getByTestId, rerender } = renderWithProviders(<Waf />)
+    expect(getByTestId('waf-connection')).toHaveTextContent('DEGRADED')
+    expect(getByTestId('waf-connection')).toHaveTextContent('dial tcp i/o timeout')
+
+    vi.mocked(useWaf).mockReturnValue({
+      data: { ...sample, connectionAgg: { ...sample.connectionAgg, state: 'down' }, worker: { ...sample.worker, state: 'down', replicas: 0 } },
+      error: undefined,
+      isLoading: false,
+    })
+    rerender(<Waf />)
+    expect(getByTestId('waf-connection')).toHaveTextContent('DOWN')
   })
 
   it('labels an empty blocklist in shadow instead of a bare 0', () => {

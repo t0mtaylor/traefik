@@ -25,6 +25,44 @@ export type WafNode = {
   lastRefresh?: number // unix millis
 }
 
+// WafConnHealth is the per-node (and aggregate) valkey link health, from the background-
+// published heartbeat + cached circuit-breaker state (never a live ping).
+export type WafConnHealth = {
+  state: 'connected' | 'degraded' | 'down' | string
+  breakerState: string // closed | open | half-open | unknown
+  breakerOpenCount: number
+  lastEnqueueOkMs?: number
+  lastFlushOkMs?: number
+  lastErrorMs?: number
+  lastError?: string
+  dropped: number
+  heartbeatMs?: number
+  stale: boolean
+  endpoint?: string
+}
+
+// WafConfig echoes what the middleware is pointed at (never the password).
+export type WafConfig = {
+  endpoint: string
+  streamKey: string
+  streamMaxLen: number
+  db: number
+  authConfigured: boolean
+  group: string
+  dialTimeoutMs: number
+  readTimeoutMs: number
+  writeTimeoutMs: number
+}
+
+export type WafWorker = {
+  group: string
+  replicas: number
+  pending: number
+  lastConsumeMs: number
+  heartbeatMs: number
+  state: string // up | degraded | down
+}
+
 export type WafResponse = {
   degraded: boolean
   reason?: string
@@ -43,6 +81,10 @@ export type WafResponse = {
   nodes: Record<string, WafNode>
   totals: WafNode
   modsec: { available: boolean; healthy: boolean | null }
+  config: WafConfig
+  connection: Record<string, WafConnHealth>
+  connectionAgg: WafConnHealth
+  worker: WafWorker
 }
 
 // Poll interval for the live WAF view.
