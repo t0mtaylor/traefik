@@ -98,3 +98,15 @@ Run the tests:
 ```sh
 go test -race ./pkg/middlewares/wafqueue/... ./cmd/waf-worker/...
 ```
+
+## Phase 2: `/api/waf` + dashboard tab (read-only)
+
+The middleware now also mirrors its hot-path action counters to valkey as per-node keys
+(`waf:stats:<node>:<action>`, flushed every 5 s off the request path, fail-open) and exposes a
+native **read-only** `GET /api/waf` endpoint (in `pkg/api`) that reports live valkey state
+swarm-wide: queue depth + worker lag, active bans + recent bans, blocklist/whitelist sizes +
+last refresh, per-node + aggregate action counters, mode (shadow/enforce) and an optional
+modsec-health flag. The endpoint is served under the existing API router (inherits dashboard
+auth + host, never public), `GET`-only, and fail-soft (valkey down ⇒ `{"degraded": true}`,
+never a `5xx`). The companion dashboard tab lives on `feature/waf-dashboard`. See `DESIGN.md`
+§9 for the full contract.

@@ -69,6 +69,7 @@ type wafQueue struct {
 
 	store   Store
 	metrics *Metrics
+	stats   *statsCollector
 
 	jobs chan enqueueJob
 }
@@ -137,6 +138,10 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 		m.store = NewValkeyStore(config.ValkeyAddr, config.ValkeySentinels, config.ValkeyMaster, config.ValkeyPassword, config.ValkeyDB)
 	}
 
+	// Per-node stats mirror for the read-only /api/waf dashboard. Lives off the request
+	// path: the hot path only does an atomic add, a background flusher pipelines to valkey.
+	m.stats = newStatsCollector(m.store, config.StatsPrefix, "")
+
 	if m.shadow {
 		logger.Info().Msg("WafQueue middleware in SHADOW mode (observe-only, will never block)")
 	} else {
@@ -149,6 +154,7 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 		go m.enqueueLoop(ctx)
 	}
 	go m.refreshLoop(ctx, refresh)
+	go m.stats.flushLoop(ctx, 5*time.Second)
 
 	return m, nil
 }
@@ -175,6 +181,7 @@ func (m *wafQueue) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// 2. Whitelist — highest precedence, beats every blocklist. Never enqueue, never block.
 	if ip.IsValid() && m.whitelist.Contains(ip) {
 		m.metrics.action(ActionWhitelist)
+		m.stats.incr(statWhitelist)
 		m.metrics.observeHotPath(time.Since(start).Seconds())
 		m.next.ServeHTTP(rw, req)
 		return
@@ -185,6 +192,7 @@ func (m *wafQueue) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if ip.IsValid() && m.blocklist.Contains(ip) {
 		if m.shadow {
 			m.metrics.action(ActionWouldBlock)
+			m.stats.incr(statWouldBlock)
 			m.metrics.block(SourceBlocklist)
 			m.logWouldBlock(req, ip)
 			m.metrics.observeHotPath(time.Since(start).Seconds())
@@ -192,6 +200,7 @@ func (m *wafQueue) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 		m.metrics.action(ActionBlock)
+		m.stats.incr(statBlock)
 		m.metrics.block(SourceBlocklist)
 		m.writeBlock(rw)
 		m.metrics.observeHotPath(time.Since(start).Seconds())
@@ -201,6 +210,7 @@ func (m *wafQueue) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// 4. Scope gate — skip enqueue for benign high-volume paths.
 	if m.scoped(req.URL.Path) {
 		m.metrics.action(ActionSkip)
+		m.stats.incr(statScoped)
 		m.metrics.observeHotPath(time.Since(start).Seconds())
 		m.next.ServeHTTP(rw, req)
 		return
@@ -209,6 +219,7 @@ func (m *wafQueue) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// 5. Enqueue (bounded, fire-and-forget) + pass immediately.
 	m.enqueue(req, ip)
 	m.metrics.action(ActionPass)
+	m.stats.incr(statPass)
 	m.metrics.observeHotPath(time.Since(start).Seconds())
 	m.next.ServeHTTP(rw, req)
 }
@@ -264,9 +275,11 @@ func (m *wafQueue) enqueue(req *http.Request, ip netip.Addr) {
 	select {
 	case m.jobs <- job:
 		m.metrics.action(ActionEnqueue)
+		m.stats.incr(statEnqueue)
 	default:
 		// Bounded queue full — drop the inspection job but still pass the request.
 		m.metrics.failOpen(ReasonEnqueue)
+		m.stats.incr(statFailOpen)
 	}
 }
 
@@ -284,12 +297,14 @@ func (m *wafQueue) enqueueLoop(ctx context.Context) {
 func (m *wafQueue) flush(ctx context.Context, job enqueueJob) {
 	if m.store == nil {
 		m.metrics.failOpen(ReasonValkey)
+		m.stats.incr(statFailOpen)
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
 	if err := m.store.Enqueue(cctx, m.streamKey, m.streamMaxLen, jobFields(job)); err != nil {
 		m.metrics.failOpen(ReasonValkey)
+		m.stats.incr(statFailOpen)
 	}
 }
 
@@ -324,6 +339,7 @@ func (m *wafQueue) refreshOnce(ctx context.Context) {
 			// Keep the trusted-proxy seed as well.
 			m.whitelist.Swap(t)
 			m.metrics.WhitelistSize.Set(float64(t.Len()))
+			m.stats.setGauge(statWhitelistSize, int64(t.Len()))
 		}
 	} else {
 		m.metrics.failOpen(ReasonRefresh)
@@ -336,6 +352,7 @@ func (m *wafQueue) refreshOnce(ctx context.Context) {
 			t := BuildTrie(bl)
 			m.blocklist.Swap(t)
 			m.metrics.BlocklistSize.Set(float64(t.Len()))
+			m.stats.setGauge(statBlocklistSize, int64(t.Len()))
 		}
 	} else {
 		m.metrics.failOpen(ReasonRefresh)
@@ -344,6 +361,8 @@ func (m *wafQueue) refreshOnce(ctx context.Context) {
 	if d, err := m.store.QueueDepth(cctx, m.streamKey); err == nil {
 		m.metrics.QueueDepth.Set(float64(d))
 	}
+
+	m.stats.setGauge(statRefreshTS, time.Now().UnixMilli())
 }
 
 func (m *wafQueue) logWouldBlock(req *http.Request, ip netip.Addr) {

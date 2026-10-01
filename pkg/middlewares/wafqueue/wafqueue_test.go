@@ -23,8 +23,11 @@ type fakeStore struct {
 	memErr  error
 	last    map[string]any
 	enqN    int
-	members []string
-	closed  bool
+	members   []string
+	closed    bool
+	flushIncr map[string]int64
+	flushSet  map[string]int64
+	flushErr  error
 }
 
 func (f *fakeStore) Enqueue(_ context.Context, _ string, _ int64, fields map[string]any) error {
@@ -42,6 +45,22 @@ func (f *fakeStore) Members(_ context.Context, _ []string) ([]string, error) {
 func (f *fakeStore) QueueDepth(_ context.Context, _ string) (int64, error) { return 0, nil }
 
 func (f *fakeStore) Close() error { f.closed = true; return nil }
+
+func (f *fakeStore) FlushStats(_ context.Context, incr map[string]int64, set map[string]int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.flushErr != nil {
+		return f.flushErr
+	}
+	if f.flushIncr == nil {
+		f.flushIncr = map[string]int64{}
+	}
+	for k, v := range incr {
+		f.flushIncr[k] += v
+	}
+	f.flushSet = set
+	return nil
+}
 
 // hijackableRecorder lets us exercise the 444/drop path.
 type hijackableRecorder struct {

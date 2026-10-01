@@ -179,3 +179,72 @@ Config via env/flags: `WAF_VALKEY_ADDR` / sentinels, `WAF_STREAM`, `WAF_GROUP`,
 5. Fail-open means even an enforcement bug cannot black-hole traffic.
 
 Nothing in Phase 1 deploys; the build is pushed to `localhost:5000` only.
+
+## 9. Phase 2 — read-only `/api/waf` endpoint (native)
+
+`feature/waf-queue` adds a native, **read-only** JSON endpoint that the dashboard WAF tab
+(`feature/waf-dashboard`) consumes. It is registered on traefik's existing API router
+(`pkg/api/handler.go` → `createRouter`), so it **inherits the dashboard/API router's auth and
+host** (`tfmx.thetomtaylor.co.uk`) and is **never a new public route**. It is served only for
+`GET`; any other method returns `405`.
+
+### 9.1 Contract
+
+`GET /api/waf[?limit=N]` → `200 application/json`. `limit` bounds the recent-bans list
+(default 20, max 100). The endpoint is **fail-soft**: valkey unreachable or no WAF middleware
+configured returns a `200` with `"degraded": true` and a `reason`, **never a `5xx`** — a valkey
+outage can never take the dashboard down.
+
+```jsonc
+{
+  "degraded": false,
+  "reason": "",                 // set when degraded
+  "timestamp": 1730000000000,
+  "mode": "shadow",             // "shadow" | "enforce" | "unknown" (from the live middleware config)
+  "middleware": "waf@file",
+  "queue":  { "depth": 7, "pending": 3, "stream": "waf:stream", "group": "waf-workers" },
+  "bans":   { "active": 12, "recent": [ { "ip": "1.2.3.4", "source": "modsec 403", "ttl": 3400, "expiresAt": 1730003400000 } ] },
+  "lists":  { "blocklistSize": 336000, "whitelistSize": 1200, "blocklistKeys": ["waf:bl:main"], "whitelistKeys": ["waf:wl:cf"], "lastRefresh": 1730000000000 },
+  "nodes":  { "mx01": { "pass": 100, "whitelist": 3, "wouldBlock": 2, "block": 5, "scoped": 40, "enqueue": 90, "failOpen": 1, "blocklistSize": 336000, "whitelistSize": 1200, "lastRefresh": 1730000000000 } },
+  "totals": { "pass": 150, "block": 6, "enqueue": 135, "... (sum across nodes)": 0 },
+  "modsec": { "available": false, "healthy": null }
+}
+```
+
+### 9.2 Valkey reads (all cheap, read-only, swarm-wide because the store is shared)
+
+| Field | valkey command(s) |
+|-------|-------------------|
+| `queue.depth` | `XLEN waf:stream` |
+| `queue.pending` (worker lag) | `XPENDING waf:stream waf-workers` (NOGROUP ⇒ 0) |
+| `bans.active` | `SCARD waf:banned` |
+| `bans.recent` | `SSCAN waf:banned` (capped at 2000) → pipelined `PTTL`+`GET waf:banned:<ip>`, sorted by TTL remaining (most-recent first), top N |
+| `lists.blocklistSize` / `whitelistSize` | `SCARD` over the middleware's `BlocklistKeys` / `WhitelistKeys` (and the per-node gauges, max) |
+| `nodes.*`, `totals` | `SCAN waf:stats:*` → pipelined `GET` (see §9.3) |
+| `modsec` | optional `GET waf:modsec:up` (reserved; the Phase-1 worker does not emit it yet) |
+
+The valkey connection (addr / sentinels / master / password / db) and the key names are read
+from the **live `WafQueue` middleware config** in the runtime configuration, so the endpoint
+needs no separate wiring; `WAF_VALKEY_ADDR` / `WAF_VALKEY_SENTINELS` / `WAF_API_GROUP` env vars
+override for an instance that only proxies. The reader is built lazily and cached; it is an
+interface (`wafReader`) so the handler test substitutes a fake and asserts read-only + fail-soft
+behaviour without a live valkey.
+
+### 9.3 Per-node stats mirror (new)
+
+Phase 1 wrote no stat counters (only a Prometheus registry). Phase 2 adds a tiny per-node
+mirror so the dashboard has live rates without new request-path state:
+
+- The hot path does only a **lock-free atomic increment** per action (`statsCollector.incr`).
+- A background flusher (every 5 s, off the request path, fail-open) pipelines the accumulated
+  deltas to valkey: **`INCRBY waf:stats:<node>:<action>`** for counters and **`SET`** for
+  gauges, each with a sliding 1 h TTL so a departed node drops out of the aggregate.
+- `<node>` = `WAF_NODE` env or the hostname. Actions: `pass`, `whitelist`, `would_block`,
+  `block`, `scoped`, `enqueue`, `failopen`. Gauges: `blocklist_size`, `whitelist_size`,
+  `refresh_ts`.
+
+This supersedes the single-counter `waf:stats:requests`/`:blocks`/… row in §3 (those global
+keys are ignored by the aggregator, which keys on `<node>:<field>`). The counters are a
+best-effort dashboard mirror; Prometheus (§6) remains the source of truth for history/alerting.
+The write path is behind the same fail-open guards as the rest of the middleware: a valkey
+error during flush re-queues the deltas for the next tick and never touches live traffic.

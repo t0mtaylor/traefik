@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/gorilla/mux"
 	"github.com/rs/zerolog/log"
@@ -61,6 +62,11 @@ type Handler struct {
 	runtimeConfiguration *runtime.Configuration
 
 	tlsManager *tls.Manager
+
+	// wafStore is the lazily-built (or test-injected) read-only valkey reader backing
+	// GET /api/waf. wafMu guards its one-time construction.
+	wafStore wafReader
+	wafMu    sync.Mutex
 }
 
 // NewBuilder returns a http.Handler builder based on runtime.Configuration.
@@ -131,6 +137,9 @@ func (h *Handler) createRouter() *mux.Router {
 
 	apiRouter.Methods(http.MethodGet).Path("/api/certificates").HandlerFunc(h.getCertificates)
 	apiRouter.Methods(http.MethodGet).Path("/api/certificates/{certificateID}").HandlerFunc(h.getCertificate)
+
+	// Async WAF read-only dashboard endpoint (fork-only). Inherits the API router auth + host.
+	apiRouter.Methods(http.MethodGet).Path("/api/waf").HandlerFunc(h.getWAF)
 
 	version.Handler{}.Append(apiRouter)
 

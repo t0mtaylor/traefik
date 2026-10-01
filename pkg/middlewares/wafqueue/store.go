@@ -2,9 +2,14 @@ package wafqueue
 
 import (
 	"context"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// statsTTL bounds how long per-node stat keys survive without a flush, so a node that leaves
+// the swarm eventually drops out of the dashboard aggregate instead of lingering forever.
+const statsTTL = time.Hour
 
 // Store is the minimal valkey surface the hot path and refresher need. It is an interface so
 // tests can substitute a fake and so a nil Store degrades to pure fail-open.
@@ -16,6 +21,10 @@ type Store interface {
 	Members(ctx context.Context, keys []string) ([]string, error)
 	// QueueDepth returns the approximate stream length (XLEN).
 	QueueDepth(ctx context.Context, streamKey string) (int64, error)
+	// FlushStats mirrors the hot-path counters to valkey: each incr entry is applied as INCRBY
+	// (cumulative), each set entry as SET (absolute gauge). All keys get a sliding TTL so dead
+	// nodes expire. It is called off the request path by the stats flusher and must fail-open.
+	FlushStats(ctx context.Context, incr map[string]int64, set map[string]int64) error
 	// Close releases the client.
 	Close() error
 }
@@ -71,6 +80,23 @@ func (s *ValkeyStore) Members(ctx context.Context, keys []string) ([]string, err
 // QueueDepth implements Store.
 func (s *ValkeyStore) QueueDepth(ctx context.Context, streamKey string) (int64, error) {
 	return s.c.XLen(ctx, streamKey).Result()
+}
+
+// FlushStats implements Store.
+func (s *ValkeyStore) FlushStats(ctx context.Context, incr map[string]int64, set map[string]int64) error {
+	if len(incr) == 0 && len(set) == 0 {
+		return nil
+	}
+	pipe := s.c.Pipeline()
+	for k, d := range incr {
+		pipe.IncrBy(ctx, k, d)
+		pipe.Expire(ctx, k, statsTTL)
+	}
+	for k, v := range set {
+		pipe.Set(ctx, k, v, statsTTL)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // Close implements Store.
