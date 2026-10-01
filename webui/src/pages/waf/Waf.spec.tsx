@@ -17,7 +17,7 @@ const sample: WafResponse = {
     active: 12,
     recent: [{ ip: '1.2.3.4', source: 'modsec 403', ttl: 3400, expiresAt: Date.now() + 3400000 }],
   },
-  lists: { blocklistSize: 336000, whitelistSize: 1200, lastRefresh: Date.now() - 20000 },
+  lists: { blocklistSize: 336000, whitelistSize: 233, lastRefresh: Date.now() - 20000 },
   nodes: {
     mx01: {
       pass: 100,
@@ -28,7 +28,7 @@ const sample: WafResponse = {
       enqueue: 90,
       failOpen: 1,
       blocklistSize: 336000,
-      whitelistSize: 1200,
+      whitelistSize: 233,
       lastRefresh: Date.now() - 20000,
     },
   },
@@ -55,11 +55,34 @@ describe('<Waf />', () => {
     const { getByTestId, getAllByTestId, getByText } = renderWithProviders(<Waf />)
 
     expect(getByTestId('waf page')).toBeInTheDocument()
-    // Mode badge appears in the header and in the node tile.
+    // Mode badge is the prominent banner at the top.
     expect(getAllByTestId('waf-mode-badge')[0]).toHaveTextContent('SHADOW')
     expect(getByTestId('waf-node-mx01')).toBeInTheDocument()
     expect(getByTestId('waf-bans-table')).toBeInTheDocument()
     expect(getByText('1.2.3.4')).toBeInTheDocument()
+  })
+
+  it('makes the shadow mode unmistakable and explains the counters', () => {
+    vi.mocked(useWaf).mockReturnValue({ data: sample, error: undefined, isLoading: false })
+
+    const { getByTestId, getByText } = renderWithProviders(<Waf />)
+    // The mode banner spells out that shadow never blocks.
+    expect(getByTestId('waf-mode-badge')).toHaveTextContent('observe-only')
+    // The always-visible legend explains the counters so the page is self-explanatory.
+    expect(getByTestId('waf-counter-legend')).toBeInTheDocument()
+    // The "requests are cumulative hit counters, not list sizes" clarification is present.
+    expect(getByText(/cumulative, since task restart/i)).toBeInTheDocument()
+  })
+
+  it('labels an empty blocklist in shadow instead of a bare 0', () => {
+    vi.mocked(useWaf).mockReturnValue({
+      data: { ...sample, lists: { ...sample.lists, blocklistSize: 0 } },
+      error: undefined,
+      isLoading: false,
+    })
+
+    const { getByText } = renderWithProviders(<Waf />)
+    expect(getByText('not loaded in shadow')).toBeInTheDocument()
   })
 
   it('handles degraded:true gracefully', () => {
