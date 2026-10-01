@@ -20,11 +20,17 @@ const autoGrid = (min: number): string => `repeat(auto-fill, minmax(min(100%, ${
 
 // The seven per-node hot-path counters, in reading order, each with a plain-language
 // description. These are CUMULATIVE HIT COUNTS since the traefik task started — NOT list sizes.
-type CounterKey = 'pass' | 'enqueue' | 'whitelist' | 'scoped' | 'block' | 'failOpen' | 'wouldBlock'
+type CounterKey = 'pass' | 'enqueue' | 'dropped' | 'whitelist' | 'scoped' | 'block' | 'failOpen' | 'wouldBlock'
 
 const COUNTERS: Array<{ key: CounterKey; label: string; desc: string; tone?: string }> = [
   { key: 'pass', label: 'pass', desc: 'Inspected and passed to the backend (in shadow every request passes).' },
   { key: 'enqueue', label: 'enqueue', desc: 'Queued to the worker for async modsec inspection.' },
+  {
+    key: 'dropped',
+    label: 'dropped',
+    desc: 'Inspection job dropped because the queue was full (valkey slow/down). The request still passed — this only skips out-of-band inspection, it never blocks or delays.',
+    tone: 'orange',
+  },
   {
     key: 'whitelist',
     label: 'whitelist',
@@ -51,6 +57,8 @@ const nodeValue = (node: WafNode, key: CounterKey): number => {
       return node.pass
     case 'enqueue':
       return node.enqueue
+    case 'dropped':
+      return node.dropped
     case 'whitelist':
       return node.whitelist
     case 'scoped':

@@ -19,6 +19,7 @@ export type WafNode = {
   scoped: number
   enqueue: number
   failOpen: number
+  dropped: number
   blocklistSize: number
   whitelistSize: number
   lastRefresh?: number // unix millis
