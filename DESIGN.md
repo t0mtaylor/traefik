@@ -248,3 +248,27 @@ keys are ignored by the aggregator, which keys on `<node>:<field>`). The counter
 best-effort dashboard mirror; Prometheus (§6) remains the source of truth for history/alerting.
 The write path is behind the same fail-open guards as the rest of the middleware: a valkey
 error during flush re-queues the deltas for the next tick and never touches live traffic.
+
+## 10. Phase 2 — dashboard WAF tab (`feature/waf-dashboard`)
+
+A read-only **WAF** tab is added to the existing traefik dashboard SPA (`webui/`, Faency +
+TypeScript), modelled on the instance-name badge PR's component style. It is a permanent,
+non-upstreamable fork branch carried through every rebase (same as the other `waf-*` branches).
+
+- **Nav + route.** A `Security → WAF` entry is added to `webui/src/routes.tsx` (shield icon),
+  which the existing `SideNavBar` renders automatically, plus a `/waf` route in
+  `webui/src/App.tsx` and a `Waf` export from `webui/src/pages/index.ts`.
+- **Data.** `webui/src/hooks/use-waf.ts` is an SWR hook that fetches `/waf` (→ `/api/waf` via
+  the dashboard's `BASE_PATH`) and **polls every 5 s** (`WAF_POLL_INTERVAL`). Because the
+  endpoint reads shared valkey, the tab is swarm-wide for free.
+- **Page.** `webui/src/pages/waf/Waf.tsx` renders: a header with the SHADOW/ENFORCE mode badge
+  + modsec-health badge; summary tiles (queue depth, worker lag, active bans, blocklist /
+  whitelist sizes, last refresh); **per-node tiles** (pass / block / enqueue / whitelist /
+  scoped / would-block / fail-open, with the mode + modsec badge and last-refresh); a
+  **recent-bans table** (ip, source, ttl); and **top blocked CIDRs** (the recent bans grouped
+  into `/24`s client-side). `degraded: true` shows a banner and still renders the partial
+  state; a fetch error and the pre-data state render their own placeholders. This phase is
+  strictly read-only — no unban / whitelist controls.
+- **Tests.** `Waf.spec.tsx` (renders tiles / node card / recent bans, handles `degraded`, shows
+  the loading state) and `use-waf.spec.ts` (fetches `/waf`, polls on `WAF_POLL_INTERVAL`).
+  `tsc` + `eslint` clean.
