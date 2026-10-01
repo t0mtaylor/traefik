@@ -52,13 +52,54 @@ Order is fixed. Every step fails **open** (on any error → pass to the backend,
    `/.well-known/*`, mail-autodiscovery) → **pass, no enqueue.** Scope is checked *after* the
    blocklist so a known-bad IP is still blocked even on a static URL; scope only suppresses
    *inspection* of benign high-volume paths.
-5. **ENQUEUE + PASS.** `XADD waf:stream` (bounded, fire-and-forget, short timeout); then
-   `next.ServeHTTP` immediately. A failed enqueue increments `waf_failopen_total` and still
-   passes.
+5. **ENQUEUE + PASS.** Hand the compact job to a **buffered channel** with a **non-blocking
+   send** (`select { case jobs <- job: … default: drop }`), then `next.ServeHTTP` immediately.
+   The request goroutine does **no valkey I/O** — it never dials, waits on, or times out
+   against valkey. If the channel is full it **drops** the inspection job (`dropped`++) and
+   passes anyway. The actual `XADD` happens on a separate background goroutine (see §2a).
 
 `InlineRoutes` regexes (e.g. `/admin`, auth POSTs, mutating methods) are recorded for the
 Phase-5 in-line sync-block path; in Phase 1 they are parsed and exposed but do not change hot
 behaviour (everything is async).
+
+## 2a. Two-plane architecture (the non-blocking guarantee)
+
+The middleware is split into two planes that share **only** a bounded channel. This is the
+core fix for the 2026-10-01 incident where a blocking enqueue added valkey's dial/write
+timeout to **every** request while valkey was failing over — "fail-open after a timeout" still
+pays the timeout, which is effectively blocking.
+
+**Plane 1 — request hot path (the request goroutine).** Pure CPU + memory, **zero network
+I/O**:
+`resolve real IP → whitelist trie (atomic.Pointer, lock-free) → scope regex → blocklist trie
+→ non-blocking channel send → next.ServeHTTP`. The tries are swapped atomically by the
+refresher, so a reader never blocks on a rebuild. Nothing here can touch valkey, so nothing
+here can wait on valkey.
+
+**Plane 2 — background enqueuer (`enqueueLoop`, 4 goroutines).** Owns the valkey client,
+drains the channel, and does the `XADD`. It is the *only* code that dials valkey on the
+enqueue path. It is guarded by:
+
+- **Buffered channel** (`jobs`, cap **8192**) with **drop-on-full**. The hot path's send is
+  non-blocking; a full channel (valkey slow/down and the drain backed up) drops the job and
+  increments `dropped`. The request still passes. This is the only backpressure the hot path
+  can feel and it is a constant-time channel operation.
+- **Circuit breaker** (`circuitbreaker.go`, threshold **3** consecutive failures, cooldown
+  **2s**). On trip it **opens**: subsequent background flushes skip the valkey dial entirely
+  (an `allow()` bool/time check, ~0 cost) so a dead valkey creates no dial storms and the
+  channel drains instantly into drops. After the cooldown it **half-opens** for one probe — a
+  success **closes** it, a failure **re-opens** it.
+- **Tiny client timeouts** (`store.go`): dial/read/write = **50 ms**, pool = 100 ms,
+  `MaxRetries = -1` (no command retries), `ContextTimeoutEnabled`. A background flush uses a
+  100 ms context. So even a flush that does dial can never stall a worker for seconds.
+
+**Guarantee (shadow AND enforce):** request latency is independent of valkey health. Proven by
+`BenchmarkHotPath_ValkeyUp` vs `BenchmarkHotPath_ValkeyDown` (unroutable `192.0.2.1:6379`) —
+equal ns/op — and by `TestHotPath_ValkeyBlackhole_NoAddedLatency` (worst request well under the
+50 ms dial timeout with a dead valkey). In **enforce** mode a blocklist hit still blocks, but
+that decision is a local in-memory trie lookup — never a valkey round-trip — so the
+non-blocking property holds in both modes. The only thing a down valkey changes is that some
+inspection jobs are dropped (counted), never that a request waits.
 
 ## 3. Valkey key schema
 
@@ -124,17 +165,23 @@ the file (yaml) provider does not call `SetDefaults()` on nested dynamic structs
 
 ## 5. Degradation matrix
 
-Condition | Behaviour
---- | ---
-valkey unreachable / enqueue error | **fail-open**: pass the request, `waf_failopen_total{reason="valkey"}`++; tries keep last-known contents
-trie refresh fails | keep **last-known** tries (feed-stale), `waf_failopen_total{reason="refresh"}`; never empties a populated trie on a transient error
-modsec down (worker) | worker **retries** with backoff; detection delayed; hot path untouched; no ban written until a verdict is obtained
-worker down entirely | stream grows to `StreamMaxLen` then trims oldest; hot path untouched; bans simply stop being added
-real-IP unresolvable | use `RemoteAddr`; a request is never blocked on an unverifiable identity (fail-open)
-`shadow: true` (default) | full pipeline runs **except** the block — logs `would-block`, passes
-block status misconfig (0) | treated as 403
+Every row's **effect on the request hot path is NONE** unless stated — the hot path does no
+valkey I/O (§2a), so valkey/worker health cannot add request latency.
 
-The invariant: **no failure mode blocks legitimate traffic.** Every error path is a pass.
+Condition | Hot-path effect | Behaviour
+--- | --- | ---
+valkey unreachable / enqueue error | **none** (background only) | background flush fails fast (≤100 ms ctx, 50 ms dial), `failopen{reason="valkey"}`++; after 3 failures the **circuit breaker opens** and subsequent flushes skip the dial entirely; tries keep last-known contents
+job channel full | **none** (constant-time drop) | hot-path send is non-blocking; the job is **dropped** and `dropped`++; the request still passes. Caused by valkey slow/down backing up the drain
+circuit breaker open | **none** | background flushes short-circuit without dialing for the 2 s cooldown, then one half-open probe; a dead valkey creates no dial storm
+trie refresh fails | **none** (background) | keep **last-known** tries (feed-stale), `failopen{reason="refresh"}`; never empties a populated trie on a transient error
+modsec down (worker) | **none** | worker **retries** with backoff; detection delayed; no ban written until a verdict is obtained
+worker down entirely | **none** | stream grows to `StreamMaxLen` then trims oldest; bans simply stop being added
+real-IP unresolvable | **none** | use `RemoteAddr`; a request is never blocked on an unverifiable identity (fail-open)
+`shadow: true` (default) | **none** | full pipeline runs **except** the block — logs `would-block`, passes
+block status misconfig (0) | — | treated as 403
+
+The invariant: **no failure mode blocks legitimate traffic, and no failure mode adds request
+latency.** Every error path is a pass, off the request goroutine.
 
 ## 6. Metrics (Prometheus)
 
@@ -145,8 +192,18 @@ Registered on a dedicated registry (see `metrics.go`); wiring into traefik's own
 - `waf_block_total{source}` — source ∈ {blocklist, banned, feed}
 - `waf_queue_depth` — gauge, approx `XLEN waf:stream`
 - `waf_hotpath_latency_seconds` — histogram of hot-path cost (target sub-ms)
-- `waf_failopen_total{reason}` — reason ∈ {valkey, refresh, enqueue, resolve}
-- `waf_blocklist_size` / `waf_whitelist_size` — gauges, trie entry counts
+- `waf_failopen_total{reason}` — reason ∈ {valkey, refresh, enqueue, resolve, **drop**} (`drop`
+  = a hot-path enqueue dropped because the bounded channel was full)
+- `waf_blocklist_size` / `waf_whitelist_size` — gauges, **true live trie entry counts** (the
+  whitelist reports its full seeded size — ~233 CF/CloudFront/owner/CGNAT CIDRs — even when no
+  valkey whitelist keys are configured; the blocklist is legitimately 0 in shadow)
+
+**Per-node dashboard counters** (`waf:stats:<node>:<field>`, read by `/api/waf`): `pass`,
+`whitelist`, `would_block`, `block`, `scoped`, `enqueue`, `failopen`, **`dropped`** (bounded-
+channel drops), plus the `blocklist_size` / `whitelist_size` / `refresh_ts` gauges. These are
+**cumulative hit counts since the task (re)started** — not list sizes — and differ between
+nodes only by traffic volume (every node loads the same tries). The breaker's open/closed
+state is observable via the `failopen{reason="valkey"}` rate when valkey is down.
 
 Worker adds (see `cmd/waf-worker`): `waf_worker_processed_total`, `waf_worker_bad_total`,
 `waf_worker_modsec_up`, `waf_worker_modsec_latency_seconds`, `waf_worker_retry_total`.

@@ -14,13 +14,17 @@ const defaultStatsPrefix = "waf:stats:"
 // Stat action/field names. These are the suffixes of the per-node keys
 // (waf:stats:<node>:<field>) that the read-only /api/waf endpoint reads back.
 const (
-	statPass          = "pass"
-	statWhitelist     = "whitelist"
-	statWouldBlock    = "would_block"
-	statBlock         = "block"
-	statScoped        = "scoped"
-	statEnqueue       = "enqueue"
-	statFailOpen      = "failopen"
+	statPass       = "pass"
+	statWhitelist  = "whitelist"
+	statWouldBlock = "would_block"
+	statBlock      = "block"
+	statScoped     = "scoped"
+	statEnqueue    = "enqueue"
+	statFailOpen   = "failopen"
+	// statDropped counts inspection jobs dropped on the hot path because the bounded job
+	// channel was full (valkey slow/down and the background drain backed up). The request
+	// still passed; only the out-of-band inspection was skipped.
+	statDropped       = "dropped"
 	statBlocklistSize = "blocklist_size"
 	statWhitelistSize = "whitelist_size"
 	statRefreshTS     = "refresh_ts"
@@ -28,7 +32,7 @@ const (
 
 // statCounterFields are the cumulative action counters (flushed as INCRBY deltas).
 var statCounterFields = []string{
-	statPass, statWhitelist, statWouldBlock, statBlock, statScoped, statEnqueue, statFailOpen,
+	statPass, statWhitelist, statWouldBlock, statBlock, statScoped, statEnqueue, statFailOpen, statDropped,
 }
 
 // statGaugeFields are absolute values (flushed as SET).

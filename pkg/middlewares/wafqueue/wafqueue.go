@@ -70,6 +70,7 @@ type wafQueue struct {
 	store   Store
 	metrics *Metrics
 	stats   *statsCollector
+	breaker *breaker
 
 	jobs chan enqueueJob
 }
@@ -122,6 +123,7 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 		scopeSkip:    compileRegexes(scopeSrc, logger),
 		inline:       compileRegexes(config.InlineRoutes, logger),
 		metrics:      NewMetrics(),
+		breaker:      newBreaker(3, 2*time.Second),
 		jobs:         make(chan enqueueJob, 8192),
 	}
 
@@ -281,14 +283,17 @@ func jobFields(job enqueueJob) map[string]any {
 
 func (m *wafQueue) enqueue(req *http.Request, ip netip.Addr) {
 	job := buildJob(req, ip)
+	// Non-blocking hand-off to the background dispatchers: the request NEVER waits on valkey
+	// I/O. If the bounded channel is full (valkey slow/down and the drain has backed up) we
+	// DROP the inspection job and return immediately — the request still passes. This is the
+	// only backpressure the hot path can feel, and it is a constant-time channel send.
 	select {
 	case m.jobs <- job:
 		m.metrics.action(ActionEnqueue)
 		m.stats.incr(statEnqueue)
 	default:
-		// Bounded queue full — drop the inspection job but still pass the request.
-		m.metrics.failOpen(ReasonEnqueue)
-		m.stats.incr(statFailOpen)
+		m.metrics.failOpen(ReasonDrop)
+		m.stats.incr(statDropped)
 	}
 }
 
@@ -309,12 +314,23 @@ func (m *wafQueue) flush(ctx context.Context, job enqueueJob) {
 		m.stats.incr(statFailOpen)
 		return
 	}
-	cctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer cancel()
-	if err := m.store.Enqueue(cctx, m.streamKey, m.streamMaxLen, jobFields(job)); err != nil {
+	// Circuit breaker: when valkey is known-down, skip the dial entirely (near-zero cost) so a
+	// background dispatcher never blocks on a stalled valkey and the job channel drains fast,
+	// keeping the hot-path drop path (non-blocking send) cheap.
+	if !m.breaker.allow() {
 		m.metrics.failOpen(ReasonValkey)
 		m.stats.incr(statFailOpen)
+		return
 	}
+	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if err := m.store.Enqueue(cctx, m.streamKey, m.streamMaxLen, jobFields(job)); err != nil {
+		m.breaker.failure()
+		m.metrics.failOpen(ReasonValkey)
+		m.stats.incr(statFailOpen)
+		return
+	}
+	m.breaker.success()
 }
 
 // refreshLoop periodically rebuilds the whitelist and blocklist tries from valkey. On error it
