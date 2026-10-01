@@ -70,6 +70,7 @@ type wafQueue struct {
 	store   Store
 	metrics *Metrics
 	stats   *statsCollector
+	breaker *breaker
 
 	jobs chan enqueueJob
 }
@@ -122,6 +123,7 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 		scopeSkip:    compileRegexes(scopeSrc, logger),
 		inline:       compileRegexes(config.InlineRoutes, logger),
 		metrics:      NewMetrics(),
+		breaker:      newBreaker(3, 2*time.Second),
 		jobs:         make(chan enqueueJob, 8192),
 	}
 
@@ -141,6 +143,15 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 	// Per-node stats mirror for the read-only /api/waf dashboard. Lives off the request
 	// path: the hot path only does an atomic add, a background flusher pipelines to valkey.
 	m.stats = newStatsCollector(m.store, config.StatsPrefix, "")
+
+	// Report the ACTUAL loaded trie sizes to the dashboard from the start, before the first
+	// refresh tick. The whitelist is seeded above from TrustedProxies (the fleet CF/CloudFront/
+	// owner/CGNAT whitelist), so its size is non-zero immediately even when no valkey whitelist
+	// keys are configured — the dashboard used to show "0 CIDRs" here, which read as an empty
+	// whitelist when the trie actually holds the full set. These gauges are the TRUE trie
+	// lengths, never a hardcoded value.
+	m.stats.setGauge(statWhitelistSize, int64(m.whitelist.Len()))
+	m.stats.setGauge(statBlocklistSize, int64(m.blocklist.Len()))
 
 	if m.shadow {
 		logger.Info().Msg("WafQueue middleware in SHADOW mode (observe-only, will never block)")
@@ -272,14 +283,17 @@ func jobFields(job enqueueJob) map[string]any {
 
 func (m *wafQueue) enqueue(req *http.Request, ip netip.Addr) {
 	job := buildJob(req, ip)
+	// Non-blocking hand-off to the background dispatchers: the request NEVER waits on valkey
+	// I/O. If the bounded channel is full (valkey slow/down and the drain has backed up) we
+	// DROP the inspection job and return immediately — the request still passes. This is the
+	// only backpressure the hot path can feel, and it is a constant-time channel send.
 	select {
 	case m.jobs <- job:
 		m.metrics.action(ActionEnqueue)
 		m.stats.incr(statEnqueue)
 	default:
-		// Bounded queue full — drop the inspection job but still pass the request.
-		m.metrics.failOpen(ReasonEnqueue)
-		m.stats.incr(statFailOpen)
+		m.metrics.failOpen(ReasonDrop)
+		m.stats.incr(statDropped)
 	}
 }
 
@@ -300,12 +314,23 @@ func (m *wafQueue) flush(ctx context.Context, job enqueueJob) {
 		m.stats.incr(statFailOpen)
 		return
 	}
-	cctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer cancel()
-	if err := m.store.Enqueue(cctx, m.streamKey, m.streamMaxLen, jobFields(job)); err != nil {
+	// Circuit breaker: when valkey is known-down, skip the dial entirely (near-zero cost) so a
+	// background dispatcher never blocks on a stalled valkey and the job channel drains fast,
+	// keeping the hot-path drop path (non-blocking send) cheap.
+	if !m.breaker.allow() {
 		m.metrics.failOpen(ReasonValkey)
 		m.stats.incr(statFailOpen)
+		return
 	}
+	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if err := m.store.Enqueue(cctx, m.streamKey, m.streamMaxLen, jobFields(job)); err != nil {
+		m.breaker.failure()
+		m.metrics.failOpen(ReasonValkey)
+		m.stats.incr(statFailOpen)
+		return
+	}
+	m.breaker.success()
 }
 
 // refreshLoop periodically rebuilds the whitelist and blocklist tries from valkey. On error it
@@ -361,6 +386,16 @@ func (m *wafQueue) refreshOnce(ctx context.Context) {
 	if d, err := m.store.QueueDepth(cctx, m.streamKey); err == nil {
 		m.metrics.QueueDepth.Set(float64(d))
 	}
+
+	// Always report the ACTUAL live trie sizes (len of the loaded CIDR tries), not the size of
+	// the sets just fetched from valkey. The whitelist keeps its TrustedProxies seed even when
+	// no valkey whitelist keys are configured, so this is the true count the dashboard shows
+	// (~233 whitelist CIDRs; blocklist legitimately 0 in shadow until the worker ban-feed is
+	// loaded). Keeping it unconditional means a transient refresh error never resets the gauge.
+	m.stats.setGauge(statWhitelistSize, int64(m.whitelist.Len()))
+	m.stats.setGauge(statBlocklistSize, int64(m.blocklist.Len()))
+	m.metrics.WhitelistSize.Set(float64(m.whitelist.Len()))
+	m.metrics.BlocklistSize.Set(float64(m.blocklist.Len()))
 
 	m.stats.setGauge(statRefreshTS, time.Now().UnixMilli())
 }
