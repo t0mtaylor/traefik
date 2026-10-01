@@ -23,6 +23,7 @@ import (
 	gapiredirect "github.com/traefik/traefik/v3/pkg/middlewares/gatewayapi/redirect"
 	"github.com/traefik/traefik/v3/pkg/middlewares/gatewayapi/urlrewrite"
 	"github.com/traefik/traefik/v3/pkg/middlewares/grpcweb"
+	"github.com/traefik/traefik/v3/pkg/middlewares/wafqueue"
 	"github.com/traefik/traefik/v3/pkg/middlewares/headers"
 	"github.com/traefik/traefik/v3/pkg/middlewares/inflightreq"
 	"github.com/traefik/traefik/v3/pkg/middlewares/ingressnginx/approot"
@@ -227,6 +228,16 @@ func (b *Builder) buildConstructor(ctx context.Context, middlewareName string) (
 		}
 		middleware = func(next http.Handler) (http.Handler, error) {
 			return grpcweb.New(ctx, next, *config.GrpcWeb, middlewareName), nil
+		}
+	}
+
+	// WafQueue (async WAF, fork-only). Defaults to shadow/observe-only; fails open everywhere.
+	if config.WafQueue != nil {
+		if middleware != nil {
+			return nil, badConf
+		}
+		middleware = func(next http.Handler) (http.Handler, error) {
+			return wafqueue.New(ctx, next, *config.WafQueue, middlewareName)
 		}
 	}
 
