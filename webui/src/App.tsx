@@ -10,7 +10,7 @@ import fetch from './libs/fetch'
 import { VersionProvider } from 'contexts/version'
 import { useIsDarkMode } from 'hooks/use-theme'
 import ErrorSuspenseWrapper from 'layout/ErrorSuspenseWrapper'
-import { Dashboard, HTTPPages, NotFound, TCPPages, UDPPages, CertificatesPages } from 'pages'
+import { Dashboard, HTTPPages, NotFound, TCPPages, UDPPages, CertificatesPages, Waf } from 'pages'
 import { DashboardSkeleton } from 'pages/dashboard/Dashboard'
 import { HubDemoContext, HubDemoProvider } from 'pages/hub-demo/demoNavContext'
 
@@ -48,6 +48,7 @@ export const Routes = () => {
               </ErrorSuspenseWrapper>
             }
           />
+          <Route path="/waf" element={<Waf />} />
           <Route path="/certificates" element={<CertificatesPages.Certificates />} />
           <Route path="/certificates/:name" element={<CertificatesPages.Certificate />} />
           <Route path="/http/routers" element={<HTTPPages.HttpRouters />} />

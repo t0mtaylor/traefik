@@ -4,5 +4,6 @@ import * as TCPPages from './tcp'
 import * as UDPPages from './udp'
 
 export { Dashboard } from './dashboard/Dashboard'
+export { Waf } from './waf'
 export { NotFound } from './NotFound'
 export { HTTPPages, TCPPages, UDPPages, CertificatesPages }

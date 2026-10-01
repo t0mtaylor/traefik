@@ -5,6 +5,7 @@ import {
   LiaCogsSolid,
   LiaHomeSolid,
   LiaCertificateSolid,
+  LiaShieldAltSolid,
 } from 'react-icons/lia'
 
 export type Route = {
@@ -94,6 +95,17 @@ export const ROUTES: RouteSections[] = [
         activeMatches: ['/udp/services/:name'],
         label: 'UDP Services',
         icon: <LiaServerSolid color="currentColor" size={20} />,
+      },
+    ],
+  },
+  {
+    section: 'waf',
+    sectionLabel: 'Security',
+    items: [
+      {
+        path: '/waf',
+        label: 'WAF',
+        icon: <LiaShieldAltSolid color="currentColor" size={20} />,
       },
     ],
   },
