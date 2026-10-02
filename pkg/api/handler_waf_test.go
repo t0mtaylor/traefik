@@ -28,13 +28,13 @@ const wafTestPassword = "test-valkey-pw-DO-NOT-LEAK"
 // so read-only is guaranteed at the type level; this fake additionally records that nothing
 // beyond the expected reads is attempted.
 type mockWAFReader struct {
-	depth    int64
-	depthErr error
-	pending  int64
-	banned   int64
-	recent   []wafBan
-	blCard   int64
-	wlCard   int64
+	depth     int64
+	depthErr  error
+	pending   int64
+	banned    int64
+	recent    []wafBan
+	blCard    int64
+	wlCard    int64
 	nodes     map[string]*wafNode
 	getVals   map[string]string
 	health    map[string]string
@@ -188,7 +188,7 @@ func TestGetWAF_ReportsConnectionHealthAndConfig(t *testing.T) {
 	now := time.Now().UnixMilli()
 	nodeHB := fmt.Sprintf(`{"node":"mx01","ts":%d,"endpoint":"ttdf-valkey-master:6379","breakerState":"closed","breakerOpenCount":0,"lastEnqueueOkMs":%d,"lastFlushOkMs":%d,"streamKey":"waf:stream","streamMaxLen":1000000,"db":0,"authConfigured":true,"dialTimeoutMs":50}`, now, now, now)
 	degradedHB := fmt.Sprintf(`{"node":"mx02","ts":%d,"endpoint":"ttdf-valkey-master:6379","breakerState":"open","breakerOpenCount":4,"lastErrorMs":%d,"lastError":"dial tcp i/o timeout","streamKey":"waf:stream","authConfigured":true}`, now, now)
-	workerHB := fmt.Sprintf(`{"consumer":"mx01","group":"waf-workers","ts":%d,"lastConsumeMs":%d,"state":"up","endpoint":"ttdf-valkey-master:6379"}`, now, now)
+	workerHB := fmt.Sprintf(`{"consumer":"mx01","group":"waf-workers","ts":%d,"lastConsumeMs":%d,"state":"up","endpoint":"ttdf-valkey-master:6379","processed1h":1200,"processed24h":28000,"modsecState":"up","modsecLastOkMs":%d,"modsecUrl":"http://10.106.0.2:8091","modsecLastErr":""}`, now, now, now)
 	reader := &mockWAFReader{
 		depth:   5,
 		pending: 2,
@@ -234,12 +234,27 @@ func TestGetWAF_ReportsConnectionHealthAndConfig(t *testing.T) {
 	assert.Equal(t, int64(4), out.Connection["mx02"].BreakerOpenCount)
 	// Aggregate: worst state wins (mx02 is degraded).
 	assert.Equal(t, "degraded", out.ConnectionAgg.State)
+	// Aggregate carries the most-recent successful valkey write (from mx01's recent heartbeat),
+	// so the dashboard shows a real "last write" timestamp, never a bare "—", while connected.
+	assert.Equal(t, now, out.ConnectionAgg.LastFlushOkMs)
+	assert.Equal(t, now, out.ConnectionAgg.LastEnqueueOkMs)
 
 	// WORKER
 	assert.Equal(t, 1, out.Worker.Replicas)
 	assert.Equal(t, "up", out.Worker.State)
 	assert.Equal(t, "waf-workers", out.Worker.Group)
 	assert.Equal(t, int64(2), out.Worker.Pending)
+	// Throughput (worker-maintained, read from the cached heartbeat).
+	assert.Equal(t, int64(1200), out.Worker.Processed1h)
+	assert.Equal(t, int64(28000), out.Worker.Processed24h)
+
+	// modsec link health, from the worker heartbeat (worker->modsec is what inspects the queue).
+	assert.True(t, out.Modsec.Available)
+	require.NotNil(t, out.Modsec.Healthy)
+	assert.True(t, *out.Modsec.Healthy)
+	assert.Equal(t, "up", out.Modsec.State)
+	assert.Equal(t, "http://10.106.0.2:8091", out.Modsec.URL)
+	assert.Equal(t, now, out.Modsec.LastCheckMs)
 
 	// No secret anywhere.
 	assert.NotContains(t, string(raw), wafTestPassword)

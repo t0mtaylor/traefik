@@ -117,7 +117,9 @@ are set, otherwise a plain client on `ValkeyAddr`).
 | `waf:bl:<name>` (`BlocklistKeys`) | set | blocklist orchestrator (reuse runtime.json/ipset pipeline) | middleware | SMEMBERS → blocklist trie |
 | `waf:refresh` | pub/sub channel | orchestrator / worker | middleware | optional immediate-refresh signal (otherwise periodic `RefreshInterval`) |
 | `waf:health:<node>` | string (JSON), TTL 30s | middleware (health heartbeat, every 5s) | dashboard / `/api/waf` | cached connection health: breaker state, last-ok timestamps, config echo. Absent/stale ⇒ node DOWN. Never the password |
-| `waf:health:worker:<consumer>` | string (JSON), TTL 30s | worker (heartbeat, every 5s) | dashboard / `/api/waf` | worker liveness: last-consume ts, group, endpoint. Replica count = number of live keys |
+| `waf:health:worker:<consumer>` | string (JSON), TTL 30s | worker (heartbeat, every 5s) | dashboard / `/api/waf` | worker liveness: last-consume, group, endpoint, throughput (1h/24h), modsec link health. Replica count = number of live keys |
+| `waf:stats:worker:pm:<min>` / `:ph:<hour>` | counter, TTL 70m / 26h | worker (delta incr) | worker (rolling sum, published in heartbeat) | durable throughput buckets (processed 1h / 24h) |
+| `waf:modsec:up` | string "1"/"0", TTL 45s | worker | dashboard / `/api/waf` | simple modsec-up bool mirror for the badge |
 
 Stream job shape (one `XADD` field map, compact):
 
@@ -274,8 +276,8 @@ outage can never take the dashboard down.
 
 | Field | valkey command(s) |
 |-------|-------------------|
-| `queue.depth` | `XLEN waf:stream` |
-| `queue.pending` (worker lag) | `XPENDING waf:stream waf-workers` (NOGROUP ⇒ 0) |
+| `queue.depth` | `XLEN waf:stream` — the **retained stream length**, bounded by `streamMaxLen` and trimmed via `MAXLEN ~`. It does **not** shrink on `XACK` (only on trim), so a steady value is healthy, **not** a backlog. The dashboard labels it "Stream length (total events retained; trims at max-len)" |
+| `queue.pending` (worker lag) | `XPENDING waf:stream waf-workers` (NOGROUP ⇒ 0) — the **real backlog**: jobs delivered to the consumer group but not yet `XACK`ed. 0–low = healthy. The dashboard presents this as the prominent health number |
 | `bans.active` | `SCARD waf:banned` |
 | `bans.recent` | `SSCAN waf:banned` (capped at 2000) → pipelined `PTTL`+`GET waf:banned:<ip>`, sorted by TTL remaining (most-recent first), top N |
 | `lists.blocklistSize` / `whitelistSize` | `SCARD` over the middleware's `BlocklistKeys` / `WhitelistKeys` (and the per-node gauges, max) |
@@ -323,7 +325,27 @@ health. `state` ∈ {`connected` (green), `degraded` (amber, breaker open), `dow
 absent heartbeat)}, plus `breakerState` (closed|open|half-open), `breakerOpenCount`,
 `lastEnqueueOkMs`, `lastFlushOkMs`, `lastErrorMs`, `lastError` (redacted), `dropped`,
 `heartbeatMs`, `stale`. `worker`: `group`, `replicas` (live heartbeats), `pending` (lag),
-`lastConsumeMs`, `state`.
+`lastConsumeMs`, `state`, `processed1h`/`processed24h` (throughput), and modsec link health
+(`modsec.state` up/down/stale, `modsec.lastCheckMs`, `modsec.url`, `modsec.lastError`).
+
+**Throughput (processed 1h/24h).** The worker counts acked jobs and, in its heartbeat (off the
+consume path), buckets the delta into per-minute (`waf:stats:worker:pm:<min>`, 1h window) and
+per-hour (`waf:stats:worker:ph:<hour>`, 24h window) valkey counters (durable across restarts via
+TTL), then publishes the rolling sums in the heartbeat. `/api/waf` reads the cached sums — no
+`XRANGE`/scan on the API path. A steady stream length with healthy throughput reads as WORKING.
+
+**modsec link health.** The worker is the only component that talks to modsec. It records the
+outcome of every real inspection and also sends a lightweight synthetic probe every ~30s
+(fire-and-forget, bounded context — never blocks the consume loop), and publishes
+`modsecState`/`lastCheckMs`/`url`/`lastError` in its heartbeat plus a `waf:modsec:up` bool.
+`/api/waf` surfaces this as `modsec` (state/url/lastCheck/error) so the dashboard shows the
+worker→modsec link is up and passing checks.
+
+`lastEnqueueOkMs` = last successful background `XADD` (only advances when there is enqueue
+traffic). `lastFlushOkMs` = last successful stats/health flush to valkey — written every ~5s
+**whenever the link is up**, regardless of traffic. `connectionAgg` aggregates both as the
+max across nodes, and the dashboard's **"Last valkey write"** uses the most recent of the two,
+so a connected fleet always shows a fresh "Ns ago" (never a bare "—") even on idle nodes.
 
 **The health mechanism is heartbeat-based, never a synchronous ping.** The handler must never
 hang if valkey is down, so it does **not** issue a `PING`/`INFO`. Instead:
