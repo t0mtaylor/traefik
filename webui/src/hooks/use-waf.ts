@@ -61,6 +61,8 @@ export type WafWorker = {
   lastConsumeMs: number
   heartbeatMs: number
   state: string // up | degraded | down
+  processed1h: number
+  processed24h: number
 }
 
 export type WafResponse = {
@@ -80,7 +82,14 @@ export type WafResponse = {
   }
   nodes: Record<string, WafNode>
   totals: WafNode
-  modsec: { available: boolean; healthy: boolean | null }
+  modsec: {
+    available: boolean
+    healthy: boolean | null
+    state?: string // up | down | stale | unknown
+    lastCheckMs?: number
+    url?: string
+    lastError?: string
+  }
   config: WafConfig
   connection: Record<string, WafConnHealth>
   connectionAgg: WafConnHealth

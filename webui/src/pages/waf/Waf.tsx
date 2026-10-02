@@ -76,9 +76,11 @@ const ModsecBadge = ({ modsec }: { modsec: WafResponse['modsec'] }) => {
   if (!modsec?.available) {
     return <Badge data-testid="waf-modsec-badge">modsec: n/a</Badge>
   }
+  const label = modsec.state || (modsec.healthy ? 'up' : 'down')
   return (
     <Badge variant={modsec.healthy ? 'green' : 'red'} data-testid="waf-modsec-badge">
-      modsec: {modsec.healthy ? 'up' : 'down'}
+      modsec: {label}
+      {modsec.lastCheckMs ? ` · ${ago(modsec.lastCheckMs)}` : ''}
     </Badge>
   )
 }
@@ -145,14 +147,27 @@ const StatusDot = ({ state }: { state: string }) => (
 
 // ConnectionPanel is the prominent valkey link-health block: aggregate state banner + the
 // breaker/heartbeat signals. All of it is from the cached heartbeat, never a live ping.
-const ConnectionPanel = ({ agg, worker }: { agg?: WafConnHealth; worker?: WafWorker }) => {
+const ConnectionPanel = ({
+  agg,
+  worker,
+  modsec,
+}: {
+  agg?: WafConnHealth
+  worker?: WafWorker
+  modsec?: WafResponse['modsec']
+}) => {
   const state = agg?.state || 'down'
   const s = linkStyle(state)
   const breaker = agg?.breakerState || 'unknown'
+  const modsecState = modsec?.available ? modsec.state || (modsec.healthy ? 'up' : 'down') : 'unknown'
+  // Most recent successful valkey write: the stats/health flush (lastFlushOkMs) advances every
+  // ~5s whenever the link is up — even with no enqueue traffic — so this is never a bare "—"
+  // while connected. Fall back to the last background XADD if a flush timestamp is missing.
+  const lastWrite = Math.max(agg?.lastFlushOkMs || 0, agg?.lastEnqueueOkMs || 0)
   return (
     <Card css={{ p: '$3', backgroundColor: s.bg, border: s.border }} data-testid="waf-connection">
       <Flex direction="column" gap={3}>
-        <Flex align="center" css={{ gap: '$2', flexWrap: 'wrap' }}>
+        <Flex align="center" css={{ gap: '$2', flexWrap: 'wrap' }} data-testid="waf-modsec-link">
           <StatusDot state={state} />
           <Text css={{ fontSize: '$4', fontWeight: '$bold', letterSpacing: 0.3, color: s.fg }}>valkey</Text>
           <Badge variant={s.badge}>{s.label}</Badge>
@@ -162,11 +177,24 @@ const ConnectionPanel = ({ agg, worker }: { agg?: WafConnHealth; worker?: WafWor
           {typeof agg?.breakerOpenCount === 'number' && agg.breakerOpenCount > 0 && (
             <Text css={{ color: s.fg, fontSize: '$2' }}>opened ×{fmt(agg.breakerOpenCount)}</Text>
           )}
+          <Box css={{ width: 1, height: 16, backgroundColor: '$colors$tableRowBorder', mx: '$1' }} />
+          <StatusDot state={modsecState} />
+          <Text css={{ fontSize: '$4', fontWeight: '$bold', letterSpacing: 0.3, color: s.fg }}>modsec</Text>
+          <Badge variant={modsecState === 'up' ? 'green' : modsecState === 'unknown' ? undefined : 'red'}>
+            {modsecState}
+          </Badge>
+          {modsec?.lastCheckMs ? (
+            <Text css={{ color: s.fg, fontSize: '$2' }}>check {ago(modsec.lastCheckMs)}</Text>
+          ) : null}
         </Flex>
         <Grid css={{ gridTemplateColumns: autoGrid(150), gap: '$3' }}>
-          <StatTile label="Last XADD ok" value={agg?.lastEnqueueOkMs ? ago(agg.lastEnqueueOkMs) : '—'} hint="enqueue heartbeat" />
-          <StatTile label="Last flush ok" value={agg?.lastFlushOkMs ? ago(agg.lastFlushOkMs) : '—'} hint="stats flush heartbeat" />
-          <StatTile label="Dropped" value={fmt(agg?.dropped)} hint="queue-full events" />
+          <StatTile label="Last valkey write" value={lastWrite ? ago(lastWrite) : '—'} hint="successful XADD / health flush — proves the link" />
+          <StatTile
+            label="modsec check"
+            value={modsec?.lastCheckMs ? ago(modsec.lastCheckMs) : '—'}
+            hint={modsec?.url ? `inspecting via ${modsec.url}` : 'worker → modsec inspection link'}
+          />
+          <StatTile label="Dropped" value={fmt(agg?.dropped)} hint="hot-path queue-full events" />
           <StatTile
             label="Worker"
             value={worker ? `${fmt(worker.replicas)} · ${worker.state}` : '—'}
@@ -175,7 +203,12 @@ const ConnectionPanel = ({ agg, worker }: { agg?: WafConnHealth; worker?: WafWor
         </Grid>
         {agg?.lastError && (
           <Text css={{ color: s.fg, fontSize: '$1', fontFamily: 'monospace', wordBreak: 'break-word' }}>
-            last error{agg.lastErrorMs ? ` (${ago(agg.lastErrorMs)})` : ''}: {agg.lastError}
+            valkey error{agg.lastErrorMs ? ` (${ago(agg.lastErrorMs)})` : ''}: {agg.lastError}
+          </Text>
+        )}
+        {modsec?.lastError && modsecState !== 'up' && (
+          <Text css={{ color: s.fg, fontSize: '$1', fontFamily: 'monospace', wordBreak: 'break-word' }}>
+            modsec error: {modsec.lastError}
           </Text>
         )}
       </Flex>
@@ -215,18 +248,26 @@ const ConfigPanel = ({ config, worker }: { config?: WafConfig; worker?: WafWorke
   </Card>
 )
 
-const StatTile = ({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) => (
-  <Card css={{ p: '$3', minWidth: 0 }}>
+const StatTile = ({
+  label,
+  value,
+  hint,
+  emphasis,
+}: {
+  label: string
+  value: ReactNode
+  hint?: string
+  emphasis?: boolean
+}) => (
+  <Card css={emphasis ? { p: '$3', minWidth: 0, borderLeft: '3px solid #3b82f6' } : { p: '$3', minWidth: 0 }}>
     <Flex direction="column" gap={1} css={{ minWidth: 0 }}>
       <Text css={{ color: '$grayBlue9', fontSize: '$1', textTransform: 'uppercase', letterSpacing: 0.2 }}>
         {label}
       </Text>
-      <Text css={{ fontSize: '$6', fontWeight: '$semiBold', color: '$hiContrast', wordBreak: 'break-word' }}>
+      <Text css={{ fontSize: emphasis ? '$8' : '$6', fontWeight: '$semiBold', color: '$hiContrast', wordBreak: 'break-word' }}>
         {value}
       </Text>
-      {hint && (
-        <Text css={{ color: '$grayBlue9', fontSize: '$1', lineHeight: 1.4 }}>{hint}</Text>
-      )}
+      {hint && <Text css={{ color: '$grayBlue9', fontSize: '$1', lineHeight: 1.4 }}>{hint}</Text>}
     </Flex>
   </Card>
 )
@@ -363,20 +404,41 @@ export const WafView = ({ data }: { data: WafResponse }) => {
           heartbeat ⇒ down; breaker open ⇒ degraded.
         </Text>
         <Grid css={{ gridTemplateColumns: autoGrid(320), gap: '$3' }}>
-          <ConnectionPanel agg={data.connectionAgg} worker={data.worker} />
+          <ConnectionPanel agg={data.connectionAgg} worker={data.worker} modsec={data.modsec} />
           <ConfigPanel config={data.config} worker={data.worker} />
         </Grid>
       </Flex>
 
       <Flex direction="column" gap={2}>
-        <H2 css={{ fontSize: '$5', color: '$headingDefault' }}>Live queue &amp; lists</H2>
+        <H2 css={{ fontSize: '$5', color: '$headingDefault' }}>Pipeline health</H2>
         <Text css={{ color: '$grayBlue9', fontSize: '$2' }}>
-          Current valkey-backed state, shared across the whole fleet.
+          Worker lag is the real backlog; stream length is just how many events are retained (it does not shrink on
+          ack). Throughput shows the worker is keeping up.
         </Text>
-        <Grid css={{ gridTemplateColumns: autoGrid(170), gap: '$3' }}>
-          <StatTile label="Queue depth" value={fmt(data.queue?.depth)} hint={`jobs waiting in ${data.queue?.stream || 'waf:stream'}`} />
-          <StatTile label="Worker lag" value={fmt(data.queue?.pending)} hint={`pending / unacked in ${data.queue?.group || 'the consumer group'}`} />
+        <Grid css={{ gridTemplateColumns: autoGrid(190), gap: '$3' }}>
+          <StatTile
+            emphasis
+            label="Worker lag (backlog)"
+            value={fmt(data.queue?.pending)}
+            hint="pending / unacked in the consumer group — the REAL backlog; 0–low = healthy"
+          />
+          <StatTile
+            label="Throughput"
+            value={`${fmt(data.worker?.processed1h)} / 1h`}
+            hint={`${fmt(data.worker?.processed24h)} processed in the last 24h`}
+          />
+          <StatTile
+            label="Stream length"
+            value={fmt(data.queue?.depth)}
+            hint={`XLEN ${data.queue?.stream || 'waf:stream'} — total events retained, trims at ${fmt(data.config?.streamMaxLen)}. NOT a backlog (does not shrink on ack).`}
+          />
           <StatTile label="Active bans" value={fmt(data.bans?.active)} hint="IPs currently banned" />
+        </Grid>
+      </Flex>
+
+      <Flex direction="column" gap={2}>
+        <H2 css={{ fontSize: '$5', color: '$headingDefault' }}>Lists</H2>
+        <Grid css={{ gridTemplateColumns: autoGrid(170), gap: '$3' }}>
           <StatTile label="Whitelist" value={`${fmt(wlSize)} CIDRs`} hint="trusted CDN / owner / CGNAT trie" />
           <StatTile label="Blocklist" value={blocklistValue} hint={blocklistHint} />
           <StatTile label="List refresh" value={ago(data.lists?.lastRefresh)} hint="whitelist / blocklist trie last reloaded" />
