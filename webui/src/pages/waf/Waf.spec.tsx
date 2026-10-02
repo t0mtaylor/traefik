@@ -45,7 +45,7 @@ const sample: WafResponse = {
     blocklistSize: 0,
     whitelistSize: 0,
   },
-  modsec: { available: false, healthy: null },
+  modsec: { available: true, healthy: true, state: 'up', lastCheckMs: Date.now() - 1200, url: 'http://10.106.0.2:8091', lastError: '' },
   config: {
     endpoint: 'ttdf-valkey-master:6379',
     streamKey: 'waf:stream',
@@ -79,7 +79,16 @@ const sample: WafResponse = {
     heartbeatMs: Date.now() - 1000,
     stale: false,
   },
-  worker: { group: 'waf-workers', replicas: 1, pending: 3, lastConsumeMs: Date.now() - 1500, heartbeatMs: Date.now() - 1000, state: 'up' },
+  worker: {
+    group: 'waf-workers',
+    replicas: 1,
+    pending: 3,
+    lastConsumeMs: Date.now() - 1500,
+    heartbeatMs: Date.now() - 1000,
+    state: 'up',
+    processed1h: 1200,
+    processed24h: 28000,
+  },
 }
 
 afterEach(() => vi.clearAllMocks())
@@ -122,6 +131,45 @@ describe('<Waf />', () => {
     expect(config).toHaveTextContent('configured')
     // endpoint appears in both connection endpoint context and config.
     expect(getAllByText(/waf:stream/i).length).toBeGreaterThan(0)
+  })
+
+  it('shows a real last-write timestamp when connected even if hot-path enqueue is 0', () => {
+    vi.mocked(useWaf).mockReturnValue({
+      data: {
+        ...sample,
+        // No hot-path enqueue stamp, but the stats/health flush is recent — must NOT show "—".
+        connectionAgg: { ...sample.connectionAgg, lastEnqueueOkMs: 0, lastFlushOkMs: Date.now() - 3000 },
+      },
+      error: undefined,
+      isLoading: false,
+    })
+    const panel = renderWithProviders(<Waf />).getByTestId('waf-connection')
+    expect(panel).toHaveTextContent(/Last valkey write/i)
+    expect(panel).not.toHaveTextContent('Last valkey write—')
+    expect(panel).toHaveTextContent(/ago/i)
+  })
+
+  it('shows the modsec link health and worker throughput', () => {
+    vi.mocked(useWaf).mockReturnValue({ data: sample, error: undefined, isLoading: false })
+    const { getByTestId, getByText } = renderWithProviders(<Waf />)
+    // modsec link in the connection panel.
+    expect(getByTestId('waf-modsec-link')).toHaveTextContent('modsec')
+    expect(getByTestId('waf-modsec-link')).toHaveTextContent('up')
+    // modsec header badge reflects state.
+    expect(getByTestId('waf-modsec-badge')).toHaveTextContent('modsec: up')
+    // throughput is shown (processed last 1h / 24h).
+    expect(getByText(/1,200 \/ 1h/)).toBeInTheDocument()
+    expect(getByText(/28,000 processed in the last 24h/)).toBeInTheDocument()
+  })
+
+  it('labels stream length as retained (not a backlog) and worker lag as the real backlog', () => {
+    vi.mocked(useWaf).mockReturnValue({ data: sample, error: undefined, isLoading: false })
+    const { getByText, getAllByText } = renderWithProviders(<Waf />)
+    expect(getByText(/Worker lag \(backlog\)/i)).toBeInTheDocument()
+    // "the REAL backlog" appears in both the section caption and the tile hint.
+    expect(getAllByText(/the REAL backlog/i).length).toBeGreaterThan(0)
+    expect(getByText(/total events retained/i)).toBeInTheDocument()
+    expect(getByText(/NOT a backlog/i)).toBeInTheDocument()
   })
 
   it('renders the degraded (breaker open) and down connection states', () => {

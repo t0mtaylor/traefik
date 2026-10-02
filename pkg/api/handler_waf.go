@@ -142,8 +142,12 @@ type wafListsInfo struct {
 }
 
 type wafModsecInfo struct {
-	Available bool  `json:"available"`
-	Healthy   *bool `json:"healthy"`
+	Available   bool   `json:"available"`
+	Healthy     *bool  `json:"healthy"`
+	State       string `json:"state,omitempty"`       // up | down | stale | unknown (from the worker)
+	LastCheckMs int64  `json:"lastCheckMs,omitempty"` // last successful inspection/probe
+	URL         string `json:"url,omitempty"`         // modsec endpoint the worker inspects against
+	LastError   string `json:"lastError,omitempty"`   // last modsec error
 }
 
 // wafConfigInfo echoes what the middleware is pointed at (never the password). Built from the
@@ -184,16 +188,24 @@ type wafWorkerInfo struct {
 	LastConsumeMs int64  `json:"lastConsumeMs"` // most recent consume across replicas
 	HeartbeatMs   int64  `json:"heartbeatMs"`   // most recent worker heartbeat
 	State         string `json:"state"`         // "up" | "degraded" | "down"
+	Processed1h   int64  `json:"processed1h"`   // jobs acked in the last hour (worker-maintained)
+	Processed24h  int64  `json:"processed24h"`  // jobs acked in the last 24h (worker-maintained)
 }
 
 // workerHealth mirrors the JSON the waf-worker publishes to waf:health:worker:<consumer>.
 type workerHealth struct {
-	Consumer      string `json:"consumer"`
-	Group         string `json:"group"`
-	TS            int64  `json:"ts"`
-	LastConsumeMs int64  `json:"lastConsumeMs"`
-	State         string `json:"state"`
-	Endpoint      string `json:"endpoint"`
+	Consumer       string `json:"consumer"`
+	Group          string `json:"group"`
+	TS             int64  `json:"ts"`
+	LastConsumeMs  int64  `json:"lastConsumeMs"`
+	State          string `json:"state"`
+	Endpoint       string `json:"endpoint"`
+	Processed1h    int64  `json:"processed1h"`
+	Processed24h   int64  `json:"processed24h"`
+	ModsecState    string `json:"modsecState"`
+	ModsecLastOkMs int64  `json:"modsecLastOkMs"`
+	ModsecURL      string `json:"modsecUrl"`
+	ModsecLastErr  string `json:"modsecLastErr"`
 }
 
 // WAFResponse is the /api/waf payload.
@@ -383,6 +395,16 @@ func (h *Handler) applyHealth(resp *WAFResponse, conn wafConn, health map[string
 		if ch.HeartbeatMs > agg.HeartbeatMs {
 			agg.HeartbeatMs = ch.HeartbeatMs
 		}
+		// Most-recent successful valkey write across the fleet. lastFlushOk is written every ~5s
+		// whenever the link is up (stats flush), so the aggregate carries a fresh timestamp even
+		// on nodes with no hot-path enqueue — the dashboard's "last write" never shows a bare "—"
+		// while connected.
+		if ch.LastFlushOkMs > agg.LastFlushOkMs {
+			agg.LastFlushOkMs = ch.LastFlushOkMs
+		}
+		if ch.LastEnqueueOkMs > agg.LastEnqueueOkMs {
+			agg.LastEnqueueOkMs = ch.LastEnqueueOkMs
+		}
 		if stateRank(ch.State) > stateRank(agg.State) {
 			agg.State = ch.State
 			agg.BreakerState = ch.BreakerState
@@ -396,6 +418,7 @@ func (h *Handler) applyHealth(resp *WAFResponse, conn wafConn, health map[string
 
 	// Worker rollup.
 	w := wafWorkerInfo{Group: conn.group, Pending: resp.Queue.Pending}
+	var freshest workerHealth
 	for _, wh := range workers {
 		w.Replicas++
 		if wh.TS > w.HeartbeatMs {
@@ -403,6 +426,17 @@ func (h *Handler) applyHealth(resp *WAFResponse, conn wafConn, health map[string
 		}
 		if wh.LastConsumeMs > w.LastConsumeMs {
 			w.LastConsumeMs = wh.LastConsumeMs
+		}
+		// All replicas INCRBY the same shared throughput buckets, so each heartbeat reports the
+		// fleet-wide rolling totals — take the max (not sum) to avoid double counting.
+		if wh.Processed1h > w.Processed1h {
+			w.Processed1h = wh.Processed1h
+		}
+		if wh.Processed24h > w.Processed24h {
+			w.Processed24h = wh.Processed24h
+		}
+		if wh.TS >= freshest.TS {
+			freshest = wh
 		}
 	}
 	switch {
@@ -412,6 +446,19 @@ func (h *Handler) applyHealth(resp *WAFResponse, conn wafConn, health map[string
 		w.State = "up"
 	}
 	resp.Worker = w
+
+	// modsec link health, authoritative from the freshest worker heartbeat (the worker is the
+	// only thing that talks to modsec). Overrides the simple waf:modsec:up bool read earlier with
+	// the richer url / last-check / error detail.
+	if freshest.ModsecState != "" {
+		healthy := freshest.ModsecState == "up"
+		resp.Modsec.Available = true
+		resp.Modsec.Healthy = &healthy
+		resp.Modsec.State = freshest.ModsecState
+		resp.Modsec.LastCheckMs = freshest.ModsecLastOkMs
+		resp.Modsec.URL = freshest.ModsecURL
+		resp.Modsec.LastError = freshest.ModsecLastErr
+	}
 }
 
 // nodeHealthWire mirrors the middleware's nodeHealth JSON (handler-side copy to avoid importing

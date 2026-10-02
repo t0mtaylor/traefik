@@ -134,9 +134,50 @@ func main() {
 // workerHealthKeyPrefix mirrors the handler's wafWorkerHealthPrefix.
 const workerHealthKeyPrefix = "waf:health:worker:"
 
-// workerHeartbeat writes waf:health:worker:<consumer> every 5s with a 30s TTL. If valkey is
-// down the write fails and the key expires, so the dashboard shows the worker DOWN. The write
-// uses a tiny timeout so it never piles up.
+// Throughput buckets: the worker increments the delta of acked jobs into a per-minute bucket
+// (1h window) and a per-hour bucket (24h window), both in valkey so the counts survive a worker
+// restart. The rolling 1h/24h sums are computed worker-side and published in the heartbeat, so
+// the /api/waf handler just reads the cached numbers (no XRANGE / scan on the API path).
+const (
+	tpMinutePrefix = "waf:stats:worker:pm:" // per-minute delta buckets (1h window)
+	tpHourPrefix   = "waf:stats:worker:ph:" // per-hour delta buckets (24h window)
+	tpMinuteTTL    = 70 * time.Minute
+	tpHourTTL      = 26 * time.Hour
+)
+
+// bucketKeys returns the keys for the last n buckets of width stepSecs ending at now (index 0 =
+// current bucket). Pure + deterministic for testing.
+func bucketKeys(prefix string, now time.Time, stepSecs, n int) []string {
+	base := now.Unix() / int64(stepSecs)
+	keys := make([]string, n)
+	for i := 0; i < n; i++ {
+		keys[i] = prefix + strconv.FormatInt(base-int64(i), 10)
+	}
+	return keys
+}
+
+// sumBuckets reads the given keys and sums their integer values (missing ⇒ 0). Off the API path.
+func sumBuckets(ctx context.Context, rdb redis.UniversalClient, keys []string) int64 {
+	cctx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	pipe := rdb.Pipeline()
+	cmds := make([]*redis.StringCmd, len(keys))
+	for i, k := range keys {
+		cmds[i] = pipe.Get(cctx, k)
+	}
+	_, _ = pipe.Exec(cctx)
+	var sum int64
+	for _, c := range cmds {
+		if v, err := c.Int64(); err == nil {
+			sum += v
+		}
+	}
+	return sum
+}
+
+// workerHeartbeat writes waf:health:worker:<consumer> every 5s with a 30s TTL, and maintains the
+// durable throughput buckets. If valkey is down the write fails and the key expires, so the
+// dashboard shows the worker DOWN. All valkey ops use tiny timeouts so they never pile up.
 func workerHeartbeat(ctx context.Context, rdb redis.UniversalClient, o options, w *Worker, log *slog.Logger) {
 	endpoint := o.valkeyAddr
 	if len(o.valkeySentinels) > 0 {
@@ -145,23 +186,86 @@ func workerHeartbeat(ctx context.Context, rdb redis.UniversalClient, o options, 
 	key := workerHealthKeyPrefix + o.consumer
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
+
+	var lastTotal, p1h, p24h int64
+	tick := 0
+
+	bucketAndCompute := func() {
+		now := time.Now()
+		total := w.ProcessedTotal()
+		if delta := total - lastTotal; delta > 0 {
+			lastTotal = total
+			cctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			pipe := rdb.Pipeline()
+			mk := tpMinutePrefix + strconv.FormatInt(now.Unix()/60, 10)
+			hk := tpHourPrefix + strconv.FormatInt(now.Unix()/3600, 10)
+			pipe.IncrBy(cctx, mk, delta)
+			pipe.Expire(cctx, mk, tpMinuteTTL)
+			pipe.IncrBy(cctx, hk, delta)
+			pipe.Expire(cctx, hk, tpHourTTL)
+			if _, err := pipe.Exec(cctx); err != nil {
+				log.Debug("throughput bucket incr failed", "err", err)
+			}
+			cancel()
+		}
+		// Recompute the rolling sums ~every 30s (every 6th tick) and on the first tick, and probe
+		// modsec so its link shows healthy even during a traffic lull. The probe is fire-and-
+		// forget with its own bounded context: the heartbeat never waits on modsec.
+		if tick%6 == 0 {
+			p1h = sumBuckets(ctx, rdb, bucketKeys(tpMinutePrefix, now, 60, 60))
+			p24h = sumBuckets(ctx, rdb, bucketKeys(tpHourPrefix, now, 3600, 24))
+			go func() {
+				pctx, pcancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+				defer pcancel()
+				w.ProbeModsec(pctx)
+			}()
+		}
+		tick++
+	}
+
 	publish := func() {
+		bucketAndCompute()
+		// modsec link health, from real inspections + the periodic probe (all off this path).
+		msOk, msErr, msErrStr := w.ModsecHealth()
+		msState := "unknown"
+		switch {
+		case msOk > 0 && time.Now().UnixMilli()-msOk < 90_000:
+			msState = "up"
+		case msErr >= msOk && msErr > 0:
+			msState = "down"
+		case msOk > 0:
+			msState = "stale"
+		}
 		payload := map[string]any{
-			"consumer":      o.consumer,
-			"group":         o.group,
-			"ts":            time.Now().UnixMilli(),
-			"lastConsumeMs": w.LastConsumeMs(),
-			"state":         "up",
-			"endpoint":      endpoint,
+			"consumer":       o.consumer,
+			"group":          o.group,
+			"ts":             time.Now().UnixMilli(),
+			"lastConsumeMs":  w.LastConsumeMs(),
+			"state":          "up",
+			"endpoint":       endpoint,
+			"processed1h":    p1h,
+			"processed24h":   p24h,
+			"modsecState":    msState,
+			"modsecLastOkMs": msOk,
+			"modsecUrl":      o.modsecURL,
+			"modsecLastErr":  msErrStr,
 		}
 		b, err := json.Marshal(payload)
 		if err != nil {
 			return
 		}
-		cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		cctx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
 		defer cancel()
 		if err := rdb.Set(cctx, key, string(b), 30*time.Second).Err(); err != nil {
 			log.Debug("worker heartbeat publish failed", "err", err)
+		}
+		// Mirror a simple bool into waf:modsec:up so the dashboard's modsec badge lights up.
+		up := "0"
+		if msState == "up" {
+			up = "1"
+		}
+		if err := rdb.Set(cctx, "waf:modsec:up", up, 45*time.Second).Err(); err != nil {
+			log.Debug("waf:modsec:up publish failed", "err", err)
 		}
 	}
 	publish()

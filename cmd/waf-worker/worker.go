@@ -74,12 +74,57 @@ type Worker struct {
 	cfg    Config
 	log    *slog.Logger
 
-	lastConsumeMs atomic.Int64 // unix millis of the last successful stream read (consume heartbeat)
+	lastConsumeMs  atomic.Int64 // unix millis of the last successful stream read (consume heartbeat)
+	processedTotal atomic.Int64 // cumulative jobs acked (processed) since start; bucketed for throughput
+
+	modsecOkMs  atomic.Int64 // unix millis of the last successful modsec inspection (real or probe)
+	modsecErrMs atomic.Int64 // unix millis of the last modsec failure
+	modsecErr   atomic.Value // last modsec error string (redaction not needed: a URL, no secret)
+}
+
+// recordModsec stamps the modsec link health from an inspection/probe result.
+func (w *Worker) recordModsec(err error) {
+	if err == nil {
+		w.modsecOkMs.Store(time.Now().UnixMilli())
+		return
+	}
+	w.modsecErrMs.Store(time.Now().UnixMilli())
+	w.modsecErr.Store(err.Error())
+}
+
+// ModsecHealth returns the last modsec ok/err timestamps and the last error string. Nil-safe for
+// the error (empty until a failure occurs).
+func (w *Worker) ModsecHealth() (okMs, errMs int64, errStr string) {
+	if v, ok := w.modsecErr.Load().(string); ok {
+		errStr = v
+	}
+	return w.modsecOkMs.Load(), w.modsecErrMs.Load(), errStr
+}
+
+// ProbeModsec sends one synthetic benign inspection to modsec to confirm the link is up even
+// when there is no live traffic. The verdict is ignored (nothing is enqueued, acked or banned);
+// only the ok/err outcome is recorded. Off the consume path.
+func (w *Worker) ProbeModsec(ctx context.Context) {
+	_, err := w.modsec.Inspect(ctx, Job{
+		ID:     "probe",
+		IP:     "127.0.0.1",
+		Method: "GET",
+		Path:   "/",
+		Host:   "waf-worker-healthcheck",
+		UA:     "waf-worker-probe",
+		TS:     time.Now().UnixMilli(),
+	})
+	w.recordModsec(err)
 }
 
 // LastConsumeMs reports when the worker last successfully read from the stream (0 if never).
 // Used by the connection-health heartbeat so the dashboard can show worker liveness.
 func (w *Worker) LastConsumeMs() int64 { return w.lastConsumeMs.Load() }
+
+// ProcessedTotal reports the cumulative number of jobs acked (reached a terminal decision)
+// since the worker started. The heartbeat buckets its delta into time windows for the
+// dashboard's 1h/24h throughput.
+func (w *Worker) ProcessedTotal() int64 { return w.processedTotal.Load() }
 
 // NewWorker builds a Worker.
 func NewWorker(cons StreamConsumer, modsec ModsecClient, bans BanStore, ttdf TTDFFeeder, cfg Config) *Worker {
@@ -148,6 +193,9 @@ func (w *Worker) ProcessBatch(ctx context.Context) error {
 		if err := w.cons.Ack(ctx, ackable...); err != nil {
 			w.log.Warn("ack failed", "err", err, "n", len(ackable))
 		}
+		// Count processed (acked) jobs for the 1h/24h throughput metric. In-memory add only;
+		// the heartbeat buckets the delta into valkey off this path.
+		w.processedTotal.Add(int64(len(ackable)))
 	}
 	return nil
 }
@@ -208,9 +256,11 @@ func (w *Worker) inspectWithRetry(ctx context.Context, job Job) (Verdict, error)
 		}
 		v, err := w.modsec.Inspect(ctx, job)
 		if err == nil {
+			w.recordModsec(nil) // modsec link healthy (real inspection succeeded)
 			return v, nil
 		}
 		lastErr = err
 	}
+	w.recordModsec(lastErr) // modsec link unhealthy after retries
 	return Verdict{}, lastErr
 }
