@@ -90,7 +90,8 @@ type wafQueue struct {
 	stats   *statsCollector
 	breaker *breaker
 
-	jobs chan enqueueJob
+	jobs  chan enqueueJob
+	retry *retryRing
 }
 
 // New builds the async WAF middleware. It never returns an error for a recoverable
@@ -143,6 +144,7 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 		metrics:      NewMetrics(),
 		breaker:      newBreaker(3, 2*time.Second),
 		jobs:         make(chan enqueueJob, 8192),
+		retry:        newRetryRing(retryRingCap),
 
 		valkeyEndpoint: valkeyEndpoint(config),
 		valkeyDB:       config.ValkeyDB,
@@ -187,6 +189,7 @@ func New(ctx context.Context, next http.Handler, config dynamic.WafQueue, name s
 	for i := 0; i < 4; i++ {
 		go m.enqueueLoop(ctx)
 	}
+	go m.retryLoop(ctx)
 	go m.refreshLoop(ctx, refresh)
 	go m.stats.flushLoop(ctx, 5*time.Second)
 	go m.healthLoop(ctx, healthInterval)
@@ -340,6 +343,58 @@ func (m *wafQueue) enqueueLoop(ctx context.Context) {
 	}
 }
 
+// retryLoop drains the bounded retry ring back into valkey once the breaker allows. It is the
+// ONLY replay path and never touches the request hot path. Every Enqueue goes through the same
+// breaker + 100ms fail-fast timeout, so a still-down valkey can never make it block or hot-spin:
+// a failed/forbidden probe stops the pass and it waits for the next tick. A panic is recovered
+// so a malformed job can never crash traefik.
+func (m *wafQueue) retryLoop(ctx context.Context) {
+	defer func() { _ = recover() }()
+	ticker := time.NewTicker(retryReplayInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.replayOnce(ctx)
+		}
+	}
+}
+
+// replayOnce replays up to maxReplayPerTick buffered jobs while valkey is reachable, in FIFO
+// order, stopping at the first breaker-open or Enqueue failure (re-buffering that job so it is
+// never lost). Bounded work per tick keeps it ctx-responsive.
+func (m *wafQueue) replayOnce(ctx context.Context) {
+	if m.store == nil {
+		return
+	}
+	for i := 0; i < maxReplayPerTick; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if !m.breaker.allow() {
+			return
+		}
+		job, ok := m.retry.pop()
+		if !ok {
+			return
+		}
+		cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		err := m.store.Enqueue(cctx, m.streamKey, m.streamMaxLen, jobFields(job))
+		cancel()
+		if err != nil {
+			m.breaker.failure(m.redactErr(err))
+			m.retry.push(job)
+			return
+		}
+		m.breaker.success()
+		m.retry.markReplayed()
+	}
+}
+
 func (m *wafQueue) flush(ctx context.Context, job enqueueJob) {
 	if m.store == nil {
 		m.metrics.failOpen(ReasonValkey)
@@ -350,6 +405,7 @@ func (m *wafQueue) flush(ctx context.Context, job enqueueJob) {
 	// background dispatcher never blocks on a stalled valkey and the job channel drains fast,
 	// keeping the hot-path drop path (non-blocking send) cheap.
 	if !m.breaker.allow() {
+		m.retry.push(job)
 		m.metrics.failOpen(ReasonValkey)
 		m.stats.incr(statFailOpen)
 		return
@@ -358,6 +414,7 @@ func (m *wafQueue) flush(ctx context.Context, job enqueueJob) {
 	defer cancel()
 	if err := m.store.Enqueue(cctx, m.streamKey, m.streamMaxLen, jobFields(job)); err != nil {
 		m.breaker.failure(m.redactErr(err))
+		m.retry.push(job)
 		m.metrics.failOpen(ReasonValkey)
 		m.stats.incr(statFailOpen)
 		return
