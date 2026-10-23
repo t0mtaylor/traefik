@@ -1,0 +1,7 @@
+FROM alpine:3.23
+RUN apk add --no-cache --no-progress ca-certificates tzdata
+COPY ./dist/linux/amd64/traefik /usr/local/bin/traefik
+RUN ln -sf /usr/local/bin/traefik /traefik
+EXPOSE 80
+VOLUME ["/tmp"]
+ENTRYPOINT ["/usr/local/bin/traefik"]
